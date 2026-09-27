@@ -163,6 +163,7 @@ XrResult plOpenXRInputDevice::CreateActions(XrSession session, XrSpace sceneSpac
   m_SubActionPath.SetCount(2);
   m_SubActionPath[0] = CreatePath("/user/hand/left");
   m_SubActionPath[1] = CreatePath("/user/hand/right");
+  m_SubActionPathVive.SetCount(3);
   m_SubActionPathVive[0] = CreatePath("/interaction_profiles/htc/vive_tracker_htcx");
   m_SubActionPathVive[1] = CreatePath("/user/vive_tracker_htcx/role/left_shoulder");
   m_SubActionPathVive[2] = CreatePath("/user/vive_tracker_htcx/role/left_shoulder/input/grip/pose");
@@ -241,6 +242,20 @@ XrResult plOpenXRInputDevice::CreateActions(XrSession session, XrSpace sceneSpac
 
   // Create the vibration output action
   XR_SUCCEED_OR_CLEANUP_LOG(CreateAction(plXRDeviceFeatures::Haptics, XR_Haptic, XR_ACTION_TYPE_VIBRATION_OUTPUT, m_HapticAction), DestroyActions);
+
+  // Left-shoulder tracker pose. Not created through CreateAction: it has no input slots and uses the tracker's
+  // subaction path instead of the hands'.
+  const bool bViveTracker = m_pOpenXR->m_Extensions.m_ViveTracker;
+  if (bViveTracker)
+  {
+    XrActionCreateInfo actionInfo{XR_TYPE_ACTION_CREATE_INFO};
+    actionInfo.actionType = XR_ACTION_TYPE_POSE_INPUT;
+    plStringUtils::Copy(actionInfo.actionName, XR_MAX_ACTION_NAME_SIZE, "left_shoulder_pose");
+    plStringUtils::Copy(actionInfo.localizedActionName, XR_MAX_LOCALIZED_ACTION_NAME_SIZE, "Left Shoulder Pose");
+    actionInfo.countSubactionPaths = 1;
+    actionInfo.subactionPaths = &m_SubActionPathVive[1];
+    XR_SUCCEED_OR_CLEANUP_LOG(xrCreateAction(m_pActionSet, &actionInfo, &shoulderPoseAction), DestroyActions);
+  }
 
   //=============================================================================
   // INTERACTION PROFILE BINDINGS
@@ -611,6 +626,16 @@ XrResult plOpenXRInputDevice::CreateActions(XrSession session, XrSpace sceneSpac
   };
   SuggestInteractionProfileBindings("/interaction_profiles/bytedance/pico_neo3_controller", "Pico Neo3", picoNeo3Controller, true);
 
+  if (bViveTracker)
+  {
+    XrActionSuggestedBinding binding{shoulderPoseAction, m_SubActionPathVive[2]};
+
+    XrInteractionProfileSuggestedBinding suggestedBindings{XR_TYPE_INTERACTION_PROFILE_SUGGESTED_BINDING};
+    suggestedBindings.interactionProfile = m_SubActionPathVive[0];
+    suggestedBindings.countSuggestedBindings = 1;
+    suggestedBindings.suggestedBindings = &binding;
+    XR_LOG_ERROR(xrSuggestInteractionProfileBindings(m_pInstance, &suggestedBindings));
+  }
 
   XrActionSpaceCreateInfo spaceCreateInfo{XR_TYPE_ACTION_SPACE_CREATE_INFO};
   spaceCreateInfo.poseInActionSpace = m_pOpenXR->ConvertTransform(plTransform::MakeIdentity());
@@ -622,6 +647,13 @@ XrResult plOpenXRInputDevice::CreateActions(XrSession session, XrSpace sceneSpac
 
     spaceCreateInfo.action = AimPose;
     XR_SUCCEED_OR_CLEANUP_LOG(xrCreateActionSpace(m_pSession, &spaceCreateInfo, &m_aimSpace[uiSide]), DestroyActions);
+  }
+
+  if (bViveTracker)
+  {
+    spaceCreateInfo.subactionPath = m_SubActionPathVive[1];
+    spaceCreateInfo.action = shoulderPoseAction;
+    XR_SUCCEED_OR_CLEANUP_LOG(xrCreateActionSpace(m_pSession, &spaceCreateInfo, &shoulderSpace), DestroyActions);
   }
 
   // Register input slots now that actions are created
@@ -654,6 +686,11 @@ void plOpenXRInputDevice::DestroyActions()
       m_aimSpace[uiSide] = XR_NULL_HANDLE;
     }
   }
+  if (shoulderSpace)
+  {
+    XR_LOG_ERROR(xrDestroySpace(shoulderSpace));
+    shoulderSpace = XR_NULL_HANDLE;
+  }
 
   for (Action& action : m_BooleanActions)
   {
@@ -684,6 +721,12 @@ void plOpenXRInputDevice::DestroyActions()
   {
     XR_LOG_ERROR(xrDestroyAction(m_HapticAction));
     m_HapticAction = XR_NULL_HANDLE;
+  }
+
+  if (shoulderPoseAction)
+  {
+    XR_LOG_ERROR(xrDestroyAction(shoulderPoseAction));
+    shoulderPoseAction = XR_NULL_HANDLE;
   }
 
   if (m_pActionSet)
@@ -950,68 +993,46 @@ void plOpenXRInputDevice::CopySnapshotToMainThread()
 }
 
 
-XrSpaceLocation plOpenXRInputDevice::UpdateLeftShoulderTracking(plXRDeviceState& deviceState)
+void plOpenXRInputDevice::UpdateLeftShoulderTracking(InputSnapshot& snapshot, XrSpace baseSpace, XrTime time)
 {
-  const XrFrameState& frameState = m_pOpenXR->m_FrameState;
+  plXRDeviceState& deviceState = snapshot.m_DeviceState[m_iLeftShoulderDeviceId];
+  plBitflags<plXRDeviceFeatures>& supportedFeatures = snapshot.m_SupportedFeatures[m_iLeftShoulderDeviceId];
 
-  const XrSpace baseSpace = m_pOpenXR->GetBaseSpace();
-  const XrTime time = frameState.predictedDisplayTime;
-
-  XrActiveActionSet activeActionSet{};
-  activeActionSet.actionSet = m_pActionSet;
-  activeActionSet.subactionPath = m_SubActionPathVive[1];
-
-  XrActionsSyncInfo syncInfo{XR_TYPE_ACTIONS_SYNC_INFO};
-  syncInfo.countActiveActionSets = 1;
-  syncInfo.activeActionSets = &activeActionSet;
-
-  xrSyncActions(m_pSession, &syncInfo);
-
-  // 2. Check Action State
+  // Uses the caller's xrSyncActions. Syncing again filtered to the tracker's subaction path would leave the hand actions
+  // inactive for the rest of the tick.
   XrActionStateGetInfo getInfo{XR_TYPE_ACTION_STATE_GET_INFO};
   getInfo.action = shoulderPoseAction;
   getInfo.subactionPath = m_SubActionPathVive[1];
 
   XrActionStatePose poseState{XR_TYPE_ACTION_STATE_POSE};
-  xrGetActionStatePose(m_pSession, &getInfo, &poseState);
+  if (shoulderSpace == XR_NULL_HANDLE || xrGetActionStatePose(m_pSession, &getInfo, &poseState) != XR_SUCCESS || !poseState.isActive)
+  {
+    // UpdateControllerState reports the tracker as disconnected once AimPose is gone.
+    supportedFeatures.Clear();
+    deviceState.m_bGripPoseIsValid = false;
+    deviceState.m_bAimPoseIsValid = false;
+    return;
+  }
+
+  // A tracker has a single pose; it is reported as both grip and aim so it looks like any other tracked device.
+  supportedFeatures = plXRDeviceFeatures::GripPose | plXRDeviceFeatures::AimPose;
+
   XrSpaceLocation location{XR_TYPE_SPACE_LOCATION};
-
-  if (poseState.isActive)
+  constexpr XrSpaceLocationFlags validFlags = XR_SPACE_LOCATION_POSITION_VALID_BIT | XR_SPACE_LOCATION_ORIENTATION_VALID_BIT;
+  if (xrLocateSpace(shoulderSpace, baseSpace, time, &location) == XR_SUCCESS && (location.locationFlags & validFlags) == validFlags)
   {
-    // 3. Locate the space relative to world reference space (e.g., STAGE or LOCAL)
-    xrLocateSpace(shoulderSpace, baseSpace, time, &location);
-
-    if ((location.locationFlags & XR_SPACE_LOCATION_POSITION_VALID_BIT) &&
-        (location.locationFlags & XR_SPACE_LOCATION_ORIENTATION_VALID_BIT))
-    {
-
-      XrVector3f pos = location.pose.position;
-      XrQuaternionf rot = location.pose.orientation;
-
-      // Pass position and rotation to your engine's tracking/IK solver
-    }
+    deviceState.m_vGripPosition = plOpenXR::ConvertPosition(location.pose.position);
+    deviceState.m_qGripRotation = plOpenXR::ConvertOrientation(location.pose.orientation);
+    deviceState.m_bGripPoseIsValid = true;
+    deviceState.m_vAimPosition = deviceState.m_vGripPosition;
+    deviceState.m_qAimRotation = deviceState.m_qGripRotation;
+    deviceState.m_bAimPoseIsValid = true;
   }
-  // Individual pose queries
-  if (xrLocateSpace(shoulderSpace, baseSpace, time, &location) == XR_SUCCESS)
+  else
   {
-    if ((location.locationFlags & (XR_SPACE_LOCATION_POSITION_VALID_BIT | XR_SPACE_LOCATION_ORIENTATION_VALID_BIT)) ==
-        (XR_SPACE_LOCATION_POSITION_VALID_BIT | XR_SPACE_LOCATION_ORIENTATION_VALID_BIT))
-    {
-      deviceState.m_vGripPosition = plOpenXR::ConvertPosition(location.pose.position);
-      deviceState.m_qGripRotation = plOpenXR::ConvertOrientation(location.pose.orientation);
-      deviceState.m_bGripPoseIsValid = true;
-      deviceState.m_vAimPosition = plOpenXR::ConvertPosition(location.pose.position);
-      deviceState.m_qAimRotation = plOpenXR::ConvertOrientation(location.pose.orientation);
-      deviceState.m_bAimPoseIsValid = true;
-    }
-    else
-    {
-
-      deviceState.m_bGripPoseIsValid = false;
-      deviceState.m_bAimPoseIsValid = false;
-    }
+    deviceState.m_bGripPoseIsValid = false;
+    deviceState.m_bAimPoseIsValid = false;
   }
-  return location;
 }
 void plOpenXRInputDevice::UpdateActionsOnInputThread()
 {
@@ -1042,7 +1063,7 @@ void plOpenXRInputDevice::UpdateActionsOnInputThread()
     return;
 
   const XrSpace baseSpace = m_pOpenXR->GetBaseSpace();
-  UpdateLeftShoulderTracking(snapshot.m_DeviceState[m_iLeftShoulderDeviceId]);
+  UpdateLeftShoulderTracking(snapshot, baseSpace, time);
 
   for (plUInt32 uiSide : {0, 1})
   {
@@ -1306,14 +1327,8 @@ void plOpenXRInputDevice::UpdateActionsOnInputThread()
 
 void plOpenXRInputDevice::UpdateControllerState()
 {
-  for (plUInt32 uiSide : {0,1,2})
+  for (plUInt32 uiControllerId : {m_iLeftControllerDeviceID, m_iRightControllerDeviceID, m_iLeftShoulderDeviceId})
   {
-
-  ///  const plUInt32 uiControllerId = uiSide +1;
-    const plUInt32 uiControllerId = uiSide == 0 ? m_iLeftControllerDeviceID : m_iRightControllerDeviceID;
-
-    //const plUInt32 uiControllerId = uiSide;
-
     const bool bDeviceConnected = m_SupportedFeatures[uiControllerId].IsSet(plXRDeviceFeatures::AimPose);
 
     if (!m_DeviceState[uiControllerId].m_bDeviceIsConnected && bDeviceConnected)
