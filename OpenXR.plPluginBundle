@@ -5,8 +5,8 @@ PluginInfo
 {
 	string %DisplayName{"Open XR"}
 	string %Category{"XR"}
-	string %MinEngineVersion{"0.7.0"}
-	string %MaxEngineVersion{"0.7.0"}
+	string %MinEngineVersion{"0.11.2"}
+	string %MaxEngineVersion{"0.11.2"}
 	// Artwork already existed under Data/Plugins/Editor/Plugins but the bundle had no
 	// fields for it, so nothing ever displayed it. It ships with the package now.
 	string %Icon{"OpenXRIcon.png"}

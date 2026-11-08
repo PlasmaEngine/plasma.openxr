@@ -32,8 +32,9 @@ as the active runtime on the machine.
 
 None resolvable through the registry. It binds to GameEngine, RendererVulkan and RendererDX12, all
 part of the engine rather than packages, so the Vulkan headers and the Agility SDK's D3D12 headers are
-read out of the SDK rather than vendored here. The Agility headers exist only once the SDK's
-RendererDX12 has been built.
+read out of the SDK rather than vendored here. The Agility headers are taken from the SDK's
+`Intermediate/` when its RendererDX12 has been built; an SDK without them (an installed engine) makes
+the build download the pinned Agility SDK version from NuGet into this package's `Intermediate/`.
 
 ## Building
 
@@ -43,7 +44,8 @@ Requires an engine SDK — a built engine checkout — named by `PLASMA_SDK_ROOT
 PLASMA_SDK_ROOT=/path/to/engine plasmabuild build OpenXRPlugin
 ```
 
-The build downloads the OpenXR SDK from NuGet on first run and extracts it under `Intermediate/`.
+The build downloads the OpenXR SDK (and, if the engine SDK lacks it, the Agility SDK) from NuGet on
+first run and extracts it under `Intermediate/`.
 Output lands in `Bin/Windows_x64_Development/`.
 
 The NuGet package declares Apache-2.0 as an SPDX expression and carries no licence text, so the

@@ -12,6 +12,12 @@ public static class PlasmaBuildOpenXR
     private const string PackageName = "OpenXR." + Version + ".nupkg";
     private const string DownloadUrl = "https://www.nuget.org/api/v2/package/OpenXR/" + Version;
 
+    // Must match AgilitySdkModule.Version in the engine: RendererDX12's headers are built against it.
+    public const string AgilitySdkVersion = "1.619.5";
+    private const string AgilitySdkPackageName = "microsoft.direct3d.d3d12." + AgilitySdkVersion + ".nupkg";
+    private const string AgilitySdkDownloadUrl =
+        "https://api.nuget.org/v3-flatcontainer/microsoft.direct3d.d3d12/" + AgilitySdkVersion + "/" + AgilitySdkPackageName;
+
     public static bool IsSupported(BuildContext context, out string disabledReason)
     {
         disabledReason = string.Empty;
@@ -21,7 +27,7 @@ public static class PlasmaBuildOpenXR
 
     public static string GetOpenXRPath(BuildContext context)
     {
-        return Path.Combine(context.ProjectRoot, "Intermediate", "PlasmaBuild", "ThirdParty", "OpenXR-" + Version);
+        return Path.Combine(GetThirdPartyRoot(context), "OpenXR-" + Version);
     }
 
     public static void EnsureOpenXR(BuildContext context)
@@ -31,39 +37,32 @@ public static class PlasmaBuildOpenXR
             throw new InvalidOperationException(disabledReason);
         }
 
-        var openXrPath = GetOpenXRPath(context);
-        if (HasExpectedOpenXRFiles(openXrPath))
-        {
-            return;
-        }
+        EnsureNuGetPackage(context, PackageName, DownloadUrl, GetOpenXRPath(context), HasExpectedOpenXRFiles);
+    }
 
-        var thirdPartyRoot = Path.Combine(context.ProjectRoot, "Intermediate", "PlasmaBuild", "ThirdParty");
-        var archivePath = Path.Combine(thirdPartyRoot, PackageName);
-        var extractMarker = archivePath + ".extracted";
+    /// \brief The package-local Agility SDK include directory, downloaded if missing.
+    ///
+    /// Used when the engine SDK does not carry its own copy, e.g. an installed engine without Intermediate/.
+    public static string EnsureAgilitySdkInclude(BuildContext context)
+    {
+        var sdkPath = Path.Combine(GetThirdPartyRoot(context), "AgilitySDK-" + AgilitySdkVersion);
+        EnsureNuGetPackage(context, AgilitySdkPackageName, AgilitySdkDownloadUrl, sdkPath, HasExpectedAgilitySdkFiles);
+        return GetAgilitySdkInclude(sdkPath);
+    }
 
-        Directory.CreateDirectory(thirdPartyRoot);
-        Directory.CreateDirectory(openXrPath);
+    public static string GetAgilitySdkInclude(string sdkPath)
+    {
+        return Path.Combine(sdkPath, "build", "native", "include");
+    }
 
-        if (!File.Exists(archivePath))
-        {
-            DownloadFile(DownloadUrl, archivePath);
-        }
+    public static bool HasExpectedAgilitySdkFiles(string sdkPath)
+    {
+        return File.Exists(Path.Combine(GetAgilitySdkInclude(sdkPath), "d3d12.h"));
+    }
 
-        if (File.Exists(extractMarker) && !HasExpectedOpenXRFiles(openXrPath))
-        {
-            File.Delete(extractMarker);
-        }
-
-        if (!File.Exists(extractMarker))
-        {
-            ZipFile.ExtractToDirectory(archivePath, openXrPath, overwriteFiles: true);
-            File.WriteAllText(extractMarker, string.Empty);
-        }
-
-        if (!HasExpectedOpenXRFiles(openXrPath))
-        {
-            throw new InvalidOperationException($"OpenXR extraction finished, but '{openXrPath}' does not contain the expected files.");
-        }
+    private static string GetThirdPartyRoot(BuildContext context)
+    {
+        return Path.Combine(context.ProjectRoot, "Intermediate", "PlasmaBuild", "ThirdParty");
     }
 
     private static bool HasExpectedOpenXRFiles(string openXrPath)
@@ -73,6 +72,43 @@ public static class PlasmaBuildOpenXR
             File.Exists(Path.Combine(openXrPath, "native", "x64", "bin", "openxr_loader.dll"));
     }
 
+    /// \brief Downloads a NuGet package into Intermediate/PlasmaBuild/ThirdParty and extracts it to extractPath.
+    ///
+    /// A cached archive that fails to extract is treated as a broken download and fetched again once.
+    private static void EnsureNuGetPackage(BuildContext context, string packageName, string url, string extractPath,
+        Func<string, bool> hasExpectedFiles)
+    {
+        if (hasExpectedFiles(extractPath))
+        {
+            return;
+        }
+
+        var archivePath = Path.Combine(GetThirdPartyRoot(context), packageName);
+        Directory.CreateDirectory(extractPath);
+
+        if (!File.Exists(archivePath))
+        {
+            DownloadFile(url, archivePath);
+        }
+
+        try
+        {
+            ZipFile.ExtractToDirectory(archivePath, extractPath, overwriteFiles: true);
+        }
+        catch (InvalidDataException)
+        {
+            File.Delete(archivePath);
+            DownloadFile(url, archivePath);
+            ZipFile.ExtractToDirectory(archivePath, extractPath, overwriteFiles: true);
+        }
+
+        if (!hasExpectedFiles(extractPath))
+        {
+            throw new InvalidOperationException(
+                $"Extracting '{packageName}' finished, but '{extractPath}' does not contain the expected files.");
+        }
+    }
+
     private static void DownloadFile(string url, string targetPath)
     {
         using var httpClient = new HttpClient();
@@ -80,9 +116,26 @@ public static class PlasmaBuildOpenXR
         response.EnsureSuccessStatusCode();
 
         Directory.CreateDirectory(Path.GetDirectoryName(targetPath)!);
-        using var source = response.Content.ReadAsStreamAsync().GetAwaiter().GetResult();
-        using var target = File.Create(targetPath);
-        source.CopyTo(target);
+
+        // Written beside the target and moved into place, so an interrupted download never looks like a cached archive.
+        var tempPath = targetPath + ".partial";
+        try
+        {
+            using (var source = response.Content.ReadAsStreamAsync().GetAwaiter().GetResult())
+            using (var target = File.Create(tempPath))
+            {
+                source.CopyTo(target);
+            }
+
+            File.Move(tempPath, targetPath, overwrite: true);
+        }
+        finally
+        {
+            if (File.Exists(tempPath))
+            {
+                File.Delete(tempPath);
+            }
+        }
     }
 }
 
@@ -100,7 +153,7 @@ public class OpenXRPluginModule : ModuleRules
         // out of the SDK rather than vendored here. The session binds to whichever renderer is active.
         PublicIncludePaths.Add(Path.Combine(PlasmaPackageSdk.Root, "Code", "ThirdParty", "Vulkan-Headers", "include"));
         PrivateLibraries.Add(Path.Combine(PlasmaPackageSdk.SdkBinaryDirectory(context), "plRendererVulkan.lib"));
-        PublicIncludePaths.Add(FindAgilitySdkInclude());
+        PublicIncludePaths.Add(FindAgilitySdkInclude(context));
         PrivateLibraries.Add(Path.Combine(PlasmaPackageSdk.SdkBinaryDirectory(context), "plRendererDX12.lib"));
 
         PublicIncludePaths.Add(Path.Combine(openXrPath, "include"));
@@ -115,27 +168,26 @@ public class OpenXRPluginModule : ModuleRules
     /// \brief The Agility SDK include directory the engine's RendererDX12 headers were built against.
     ///
     /// RendererDX12 uses interfaces (ID3D12Device10, ID3D12GraphicsCommandList7) that the Windows SDK copy of
-    /// d3d12.h may lack, so the SDK's Agility headers must come first. The engine build fetches them.
-    private static string FindAgilitySdkInclude()
+    /// d3d12.h may lack, so the Agility headers must come first. The engine SDK's own copy wins; an SDK without one
+    /// (an installed engine ships no Intermediate/) falls back to the pinned version, downloaded into this package.
+    private static string FindAgilitySdkInclude(BuildContext context)
     {
         var thirdParty = Path.Combine(PlasmaPackageSdk.Root, "Intermediate", "PlasmaBuild", "ThirdParty");
         if (Directory.Exists(thirdParty))
         {
             foreach (var dir in Directory.GetDirectories(thirdParty, "AgilitySDK-*").OrderByDescending(d => d, StringComparer.OrdinalIgnoreCase))
             {
-                var include = Path.Combine(dir, "build", "native", "include");
-                if (File.Exists(Path.Combine(include, "d3d12.h")))
+                if (PlasmaBuildOpenXR.HasExpectedAgilitySdkFiles(dir))
                 {
-                    return include;
+                    return PlasmaBuildOpenXR.GetAgilitySdkInclude(dir);
                 }
             }
         }
 
-        throw new DirectoryNotFoundException(
-            $"No Agility SDK headers under '{thirdParty}'. Build the engine's RendererDX12 once so it fetches them.");
+        return PlasmaBuildOpenXR.EnsureAgilitySdkInclude(context);
     }
 
-    /// rief Copies openxr_loader.dll and its licence beside the plugin.
+    /// \brief Copies openxr_loader.dll and its licence beside the plugin.
     ///
     /// The engine does this through PlasmaBuildRuntimeFiles, which does not exist out here.
     private static void StageLoader(BuildContext context, string openXrPath)
