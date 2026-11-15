@@ -33,7 +33,7 @@ plOpenXRHandTracking::plOpenXRHandTracking(plOpenXR* pOpenXR)
     XR_LOG_ERROR(m_pOpenXR->m_Extensions.pfn_xrCreateHandTrackerEXT(pOpenXR->m_pSession, &createInfo, &m_HandTracker[uiSide]));
 
     m_Locations[uiSide].type = XR_TYPE_HAND_JOINT_LOCATIONS_EXT;
-    m_Locations[uiSide].next = &m_Velocities;
+    m_Locations[uiSide].next = &m_Velocities[uiSide];
     m_Locations[uiSide].jointCount = XR_HAND_JOINT_COUNT_EXT;
     m_Locations[uiSide].jointLocations = m_JointLocations[uiSide];
 

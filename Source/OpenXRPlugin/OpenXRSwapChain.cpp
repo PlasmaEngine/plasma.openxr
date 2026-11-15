@@ -12,7 +12,11 @@ void plGALOpenXRSwapChain::AcquireNextRenderTarget(plGALDevice* pDevice)
   PL_PROFILE_SCOPE("AcquireNextRenderTarget");
   if (m_bImageAcquired)
   {
-    plLog::Warning("AcquireNextRenderTarget called while image is still acquired. Forcing release.");
+    static plTime s_LastLog;
+    if (plOpenXRShouldLogThrottled(s_LastLog))
+    {
+      plLog::Warning("AcquireNextRenderTarget called while image is still acquired. Forcing release.");
+    }
     PresentRenderTarget();
     m_bImageAcquired = false;
   }
@@ -262,9 +266,7 @@ XrResult plGALOpenXRSwapChain::InitSwapChain(plGALMSAASampleCount::Enum msaaCoun
   {
     XR_SUCCEED_OR_CLEANUP_LOG(xrCreateSwapchain(m_pSession, &swapchainCreateInfo, &swapchain.handle), voidFunction);
     XR_SUCCEED_OR_CLEANUP_LOG(xrEnumerateSwapchainImages(swapchain.handle, 0, &swapchain.imageCount, nullptr), voidFunction);
-    CreateSwapchainImages(swapchain, type);
-
-    return XrResult::XR_SUCCESS;
+    return CreateSwapchainImages(swapchain, type);
   };
   XR_SUCCEED_OR_CLEANUP_LOG(CreateSwapChain(swapchainCreateInfo, m_ColorSwapchain, SwapchainType::Color), DeinitSwapChain);
 

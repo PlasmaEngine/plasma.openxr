@@ -8,7 +8,12 @@ Output/
 *.exp
 *.lib
 *.dll
+*.so
 *.link.rsp
+
+# Generated project files
+compile_commands.json
+*.slnx
 
 # Generated Qt sources (moc/uic/rcc)
 *.moc.cpp

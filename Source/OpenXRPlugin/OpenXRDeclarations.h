@@ -41,3 +41,15 @@
   } while (false)
 
 static void voidFunction() {}
+
+/// \brief Returns true at most once per interval for the given timestamp, for logs that would otherwise repeat every
+/// frame.
+inline bool plOpenXRShouldLogThrottled(plTime& ref_lastLog, plTime interval = plTime::MakeFromSeconds(1.0))
+{
+  const plTime now = plTime::Now();
+  if (ref_lastLog.IsPositive() && now - ref_lastLog < interval)
+    return false;
+
+  ref_lastLog = now;
+  return true;
+}
