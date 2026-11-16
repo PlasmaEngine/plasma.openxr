@@ -50,9 +50,10 @@ plXRSpatialAnchorID plOpenXRSpatialAnchors::CreateAnchor(const plTransform& glob
   createInfo.space = m_pOpenXR->GetBaseSpace();
   createInfo.pose.position = plOpenXR::ConvertPosition(local.m_vPosition);
   createInfo.pose.orientation = plOpenXR::ConvertOrientation(local.m_qRotation);
-  createInfo.time = m_pOpenXR->m_FrameState.predictedDisplayTime;
+  // Components call this during the world update, which can overlap the main thread rewriting m_FrameState.
+  createInfo.time = m_pOpenXR->GetPredictedDisplayTime();
 
-  XrSpatialAnchorMSFT anchor;
+  XrSpatialAnchorMSFT anchor = XR_NULL_HANDLE;
   XrResult res = m_pOpenXR->m_Extensions.pfn_xrCreateSpatialAnchorMSFT(m_pOpenXR->m_pSession, &createInfo, &anchor);
   if (res != XrResult::XR_SUCCESS)
     return plXRSpatialAnchorID();
@@ -61,8 +62,14 @@ plXRSpatialAnchorID plOpenXRSpatialAnchors::CreateAnchor(const plTransform& glob
   createSpaceInfo.anchor = anchor;
   createSpaceInfo.poseInAnchorSpace = plOpenXR::ConvertTransform(plTransform::MakeIdentity());
 
-  XrSpace space;
+  XrSpace space = XR_NULL_HANDLE;
   res = m_pOpenXR->m_Extensions.pfn_xrCreateSpatialAnchorSpaceMSFT(m_pOpenXR->m_pSession, &createSpaceInfo, &space);
+  if (res != XrResult::XR_SUCCESS)
+  {
+    plLog::Error("OpenXR: Creating the space for a spatial anchor failed: {}", res);
+    XR_LOG_ERROR(m_pOpenXR->m_Extensions.pfn_xrDestroySpatialAnchorMSFT(anchor));
+    return plXRSpatialAnchorID();
+  }
 
   return m_Anchors.Insert({anchor, space});
 }
@@ -90,7 +97,7 @@ plResult plOpenXRSpatialAnchors::TryGetAnchorTransform(plXRSpatialAnchorID id, p
   if (!m_Anchors.TryGetValue(id, anchorData))
     return PL_FAILURE;
 
-  const XrTime time = m_pOpenXR->m_FrameState.predictedDisplayTime;
+  const XrTime time = m_pOpenXR->GetPredictedDisplayTime();
   XrSpaceLocation viewInScene = {XR_TYPE_SPACE_LOCATION};
   XrResult res = xrLocateSpace(anchorData.m_Space, m_pOpenXR->m_pSceneSpace, time, &viewInScene);
   if (res != XrResult::XR_SUCCESS)

@@ -1,5 +1,7 @@
 #include <OpenXRPlugin/OpenXRPluginPCH.h>
 
+#include <Core/Input/ActionMap/InputActionMap.h>
+#include <Core/Input/ActionMap/InputGlyphs.h>
 #include <Core/Input/InputManager.h>
 #include <Foundation/Configuration/CVar.h>
 #include <Foundation/Math/Math.h>
@@ -12,6 +14,9 @@
 // Off by default: SteamVR's XR_KHR_locate_spaces implementation faults inside vrclient_x64.dll on a well-formed
 // xrLocateSpacesKHR call. The per-space xrLocateSpace path below is the conventional one and costs two extra calls per
 // hand per input tick, which is not measurable. Turn this on only to test a runtime's batched path.
+PL_DEFINE_AS_POD_TYPE(XrControllerModelNodePropertiesMSFT);
+PL_DEFINE_AS_POD_TYPE(XrRenderModelPathInfoFB);
+
 plCVarBool cvar_XrBatchedSpaceLocation("XR.BatchedSpaceLocation", false, plCVarFlags::Save, "Use xrLocateSpacesKHR to locate both hand spaces in one call.");
 
 // clang-format off
@@ -21,33 +26,231 @@ PL_END_DYNAMIC_REFLECTED_TYPE;
 // clang-format on
 
 
-#define XR_Trigger "trigger_value"
-#define XR_Trigger_Touch "trigger_touch"
+// Defined in OpenXRSingleton.cpp, which requests the extensions. Latched again at session start.
+extern plCVarBool cvar_XrBindingModification;
+extern plCVarBool cvar_XrDpadBinding;
+extern plCVarBool cvar_XrPalmPose;
 
-#define XR_Select_Click "select_click"
-#define XR_Menu_Click "menu_click"
+namespace
+{
+  struct BuiltInAction
+  {
+    plXRDeviceFeatures::Enum m_Feature;
+    const char* m_szName;
+    XrActionType m_Type;
+  };
 
-#define XR_Grip "grip_value"
-#define XR_Grip_Click "grip_click"
+  // The actions behind the 'xr_hand_<side>_<name>' input slots. XRInteractionProfiles.ddl binds them by name. The grip
+  // pose must stay the first pose action: the input thread asks it whether a controller is active.
+  constexpr BuiltInAction s_BuiltInActions[] = {
+    {plXRDeviceFeatures::Trigger, "trigger_value", XR_ACTION_TYPE_FLOAT_INPUT},
+    {plXRDeviceFeatures::Grip, "grip_value", XR_ACTION_TYPE_FLOAT_INPUT},
+    {plXRDeviceFeatures::TriggerTouch, "trigger_touch", XR_ACTION_TYPE_BOOLEAN_INPUT},
+    {plXRDeviceFeatures::Select, "select_click", XR_ACTION_TYPE_BOOLEAN_INPUT},
+    {plXRDeviceFeatures::Menu, "menu_click", XR_ACTION_TYPE_BOOLEAN_INPUT},
+    {plXRDeviceFeatures::GripClick, "grip_click", XR_ACTION_TYPE_BOOLEAN_INPUT},
+    {plXRDeviceFeatures::ButtonA, "button_a", XR_ACTION_TYPE_BOOLEAN_INPUT},
+    {plXRDeviceFeatures::ButtonATouch, "button_a_touch", XR_ACTION_TYPE_BOOLEAN_INPUT},
+    {plXRDeviceFeatures::ButtonB, "button_b", XR_ACTION_TYPE_BOOLEAN_INPUT},
+    {plXRDeviceFeatures::ButtonBTouch, "button_b_touch", XR_ACTION_TYPE_BOOLEAN_INPUT},
+    {plXRDeviceFeatures::Thumbrest, "thumbrest", XR_ACTION_TYPE_BOOLEAN_INPUT},
+    {plXRDeviceFeatures::PrimaryAnalogStick, "primary_analog_stick", XR_ACTION_TYPE_VECTOR2F_INPUT},
+    {plXRDeviceFeatures::PrimaryAnalogStickClick, "primary_analog_stick_click", XR_ACTION_TYPE_BOOLEAN_INPUT},
+    {plXRDeviceFeatures::PrimaryAnalogStickTouch, "primary_analog_stick_touch", XR_ACTION_TYPE_BOOLEAN_INPUT},
+    {plXRDeviceFeatures::SecondaryAnalogStick, "secondary_analog_stick", XR_ACTION_TYPE_VECTOR2F_INPUT},
+    {plXRDeviceFeatures::SecondaryAnalogStickClick, "secondary_analog_stick_click", XR_ACTION_TYPE_BOOLEAN_INPUT},
+    {plXRDeviceFeatures::SecondaryAnalogStickTouch, "secondary_analog_stick_touch", XR_ACTION_TYPE_BOOLEAN_INPUT},
+    {plXRDeviceFeatures::GripPose, "grip_pose", XR_ACTION_TYPE_POSE_INPUT},
+    {plXRDeviceFeatures::AimPose, "aim_pose", XR_ACTION_TYPE_POSE_INPUT},
+    {plXRDeviceFeatures::Haptics, "haptic", XR_ACTION_TYPE_VIBRATION_OUTPUT},
+  };
 
-#define XR_Button_A "button_a"
-#define XR_Button_A_Touch "button_a_touch"
-#define XR_Button_B "button_b"
-#define XR_Button_B_Touch "button_b_touch"
-#define XR_Thumbrest "thumbrest"
+  // Used when Data/Base/RuntimeConfigs/XRInteractionProfiles.ddl is missing: the profiles and built-in bindings of that
+  // file, without the components nothing is bound to.
+  constexpr const char* s_szBuiltInProfiles =
+    R"(
+Profile { string %Path { "/interaction_profiles/khr/simple_controller" } string %DisplayName { "Simple Controller" }
+  Component { string %Path { "/input/select/click" } string %Type { "Boolean" } string %Actions { "select_click" } }
+  Component { string %Path { "/input/menu/click" } string %Type { "Boolean" } string %Actions { "menu_click" } }
+  Component { string %Path { "/input/grip/pose" } string %Type { "Pose" } string %Actions { "grip_pose" } }
+  Component { string %Path { "/input/aim/pose" } string %Type { "Pose" } string %Actions { "aim_pose" } }
+  Component { string %Path { "/output/haptic" } string %Type { "Vibration" } string %Actions { "haptic" } }
+}
+Profile { string %Path { "/interaction_profiles/microsoft/motion_controller" } string %DisplayName { "Mixed Reality Motion Controller" }
+  Component { string %Path { "/input/trigger/value" } string %Type { "Float" } string %Actions { "trigger_value", "select_click" } }
+  Component { string %Path { "/input/menu/click" } string %Type { "Boolean" } string %Actions { "menu_click" } }
+  Component { string %Path { "/input/squeeze/click" } string %Type { "Boolean" } string %Actions { "grip_value", "grip_click" } }
+  Component { string %Path { "/input/thumbstick" } string %Type { "Vector2" } string %Actions { "primary_analog_stick" } }
+  Component { string %Path { "/input/thumbstick/click" } string %Type { "Boolean" } string %Actions { "primary_analog_stick_click" } }
+  Component { string %Path { "/input/trackpad" } string %Type { "Vector2" } string %Actions { "secondary_analog_stick" } }
+  Component { string %Path { "/input/trackpad/click" } string %Type { "Boolean" } string %Actions { "secondary_analog_stick_click" } }
+  Component { string %Path { "/input/trackpad/touch" } string %Type { "Boolean" } string %Actions { "secondary_analog_stick_touch" } }
+  Component { string %Path { "/input/grip/pose" } string %Type { "Pose" } string %Actions { "grip_pose" } }
+  Component { string %Path { "/input/aim/pose" } string %Type { "Pose" } string %Actions { "aim_pose" } }
+  Component { string %Path { "/output/haptic" } string %Type { "Vibration" } string %Actions { "haptic" } }
+}
+Profile { string %Path { "/interaction_profiles/oculus/touch_controller" } string %DisplayName { "Oculus Touch Controller" }
+  Component { string %Path { "/input/trigger/value" } string %Type { "Float" } string %Actions { "trigger_value", "select_click" } }
+  Component { string %Path { "/input/trigger/touch" } string %Type { "Boolean" } string %Actions { "trigger_touch" } }
+  Component { string %Path { "/input/menu/click" } string %Hands { "left" } string %Type { "Boolean" } string %Actions { "menu_click" } }
+  Component { string %Path { "/input/squeeze/value" } string %Type { "Float" } string %Actions { "grip_value", "grip_click" } }
+  Component { string %Path { "/input/thumbstick" } string %Type { "Vector2" } string %Actions { "primary_analog_stick" } }
+  Component { string %Path { "/input/thumbstick/click" } string %Type { "Boolean" } string %Actions { "primary_analog_stick_click" } }
+  Component { string %Path { "/input/thumbstick/touch" } string %Type { "Boolean" } string %Actions { "primary_analog_stick_touch" } }
+  Component { string %Path { "/input/x/click" } string %Hands { "left" } string %Type { "Boolean" } string %Actions { "button_a" } }
+  Component { string %Path { "/input/x/touch" } string %Hands { "left" } string %Type { "Boolean" } string %Actions { "button_a_touch" } }
+  Component { string %Path { "/input/y/click" } string %Hands { "left" } string %Type { "Boolean" } string %Actions { "button_b" } }
+  Component { string %Path { "/input/y/touch" } string %Hands { "left" } string %Type { "Boolean" } string %Actions { "button_b_touch" } }
+  Component { string %Path { "/input/a/click" } string %Hands { "right" } string %Type { "Boolean" } string %Actions { "button_a" } }
+  Component { string %Path { "/input/a/touch" } string %Hands { "right" } string %Type { "Boolean" } string %Actions { "button_a_touch" } }
+  Component { string %Path { "/input/b/click" } string %Hands { "right" } string %Type { "Boolean" } string %Actions { "button_b" } }
+  Component { string %Path { "/input/b/touch" } string %Hands { "right" } string %Type { "Boolean" } string %Actions { "button_b_touch" } }
+  Component { string %Path { "/input/thumbrest/touch" } string %Type { "Boolean" } string %Actions { "thumbrest" } }
+  Component { string %Path { "/input/grip/pose" } string %Type { "Pose" } string %Actions { "grip_pose" } }
+  Component { string %Path { "/input/aim/pose" } string %Type { "Pose" } string %Actions { "aim_pose" } }
+  Component { string %Path { "/output/haptic" } string %Type { "Vibration" } string %Actions { "haptic" } }
+}
+)"
+    R"(
+Profile { string %Path { "/interaction_profiles/valve/index_controller" } string %DisplayName { "Valve Index Controller" }
+  Component { string %Path { "/input/trigger/value" } string %Type { "Float" } string %Actions { "trigger_value" } }
+  Component { string %Path { "/input/trigger/touch" } string %Type { "Boolean" } string %Actions { "trigger_touch" } }
+  Component { string %Path { "/input/trigger/click" } string %Type { "Boolean" } string %Actions { "select_click" } }
+  Component { string %Path { "/input/squeeze/value" } string %Type { "Float" } string %Actions { "grip_value" } }
+  Component { string %Path { "/input/squeeze/force" } string %Type { "Float" } string %Actions { "grip_click" } }
+  Component { string %Path { "/input/thumbstick" } string %Type { "Vector2" } string %Actions { "primary_analog_stick" } }
+  Component { string %Path { "/input/thumbstick/click" } string %Type { "Boolean" } string %Actions { "primary_analog_stick_click" } }
+  Component { string %Path { "/input/thumbstick/touch" } string %Type { "Boolean" } string %Actions { "primary_analog_stick_touch", "thumbrest" } }
+  Component { string %Path { "/input/trackpad" } string %Type { "Vector2" } string %Actions { "secondary_analog_stick" } }
+  Component { string %Path { "/input/trackpad/touch" } string %Type { "Boolean" } string %Actions { "secondary_analog_stick_touch" } }
+  Component { string %Path { "/input/a/click" } string %Type { "Boolean" } string %Actions { "button_a" } }
+  Component { string %Path { "/input/a/touch" } string %Type { "Boolean" } string %Actions { "button_a_touch" } }
+  Component { string %Path { "/input/b/click" } string %Type { "Boolean" } string %Actions { "button_b" } }
+  Component { string %Path { "/input/b/touch" } string %Type { "Boolean" } string %Actions { "button_b_touch" } }
+  Component { string %Path { "/input/grip/pose" } string %Type { "Pose" } string %Actions { "grip_pose" } }
+  Component { string %Path { "/input/aim/pose" } string %Type { "Pose" } string %Actions { "aim_pose" } }
+  Component { string %Path { "/output/haptic" } string %Type { "Vibration" } string %Actions { "haptic" } }
+}
+Profile { string %Path { "/interaction_profiles/htc/vive_controller" } string %DisplayName { "HTC Vive Controller" }
+  Component { string %Path { "/input/trigger/value" } string %Type { "Float" } string %Actions { "trigger_value" } }
+  Component { string %Path { "/input/trigger/click" } string %Type { "Boolean" } string %Actions { "select_click" } }
+  Component { string %Path { "/input/menu/click" } string %Type { "Boolean" } string %Actions { "menu_click" } }
+  Component { string %Path { "/input/squeeze/click" } string %Type { "Boolean" } string %Actions { "grip_click" } }
+  Component { string %Path { "/input/trackpad" } string %Type { "Vector2" } string %Actions { "primary_analog_stick" } }
+  Component { string %Path { "/input/trackpad/click" } string %Type { "Boolean" } string %Actions { "primary_analog_stick_click" } }
+  Component { string %Path { "/input/trackpad/touch" } string %Type { "Boolean" } string %Actions { "primary_analog_stick_touch" } }
+  Component { string %Path { "/input/grip/pose" } string %Type { "Pose" } string %Actions { "grip_pose" } }
+  Component { string %Path { "/input/aim/pose" } string %Type { "Pose" } string %Actions { "aim_pose" } }
+  Component { string %Path { "/output/haptic" } string %Type { "Vibration" } string %Actions { "haptic" } }
+}
+Profile { string %Path { "/interaction_profiles/microsoft/hand_interaction" } string %DisplayName { "Hand Interaction" } string %Extension { "XR_MSFT_hand_interaction" }
+  Component { string %Path { "/input/select/value" } string %Type { "Float" } string %Actions { "select_click" } }
+  Component { string %Path { "/input/squeeze/value" } string %Type { "Float" } string %Actions { "grip_value" } }
+  Component { string %Path { "/input/grip/pose" } string %Type { "Pose" } string %Actions { "grip_pose" } }
+  Component { string %Path { "/input/aim/pose" } string %Type { "Pose" } string %Actions { "aim_pose" } }
+}
+Profile { string %Path { "/interaction_profiles/ext/hand_interaction_ext" } string %DisplayName { "Hand Interaction" } string %Extension { "XR_EXT_hand_interaction" }
+  Component { string %Path { "/input/aim_activate_ext/value" } string %Type { "Float" } string %Actions { "trigger_value", "select_click" } }
+  Component { string %Path { "/input/grasp_ext/value" } string %Type { "Float" } string %Actions { "grip_value", "grip_click" } }
+  Component { string %Path { "/input/grip/pose" } string %Type { "Pose" } string %Actions { "grip_pose" } }
+  Component { string %Path { "/input/aim/pose" } string %Type { "Pose" } string %Actions { "aim_pose" } }
+}
+)"
+    R"(
+Profile { string %Path { "/interaction_profiles/facebook/touch_controller_pro" } string %DisplayName { "Meta Quest Touch Pro" } string %Extension { "XR_FB_touch_controller_pro" }
+  Component { string %Path { "/input/trigger/value" } string %Type { "Float" } string %Actions { "trigger_value", "select_click" } }
+  Component { string %Path { "/input/trigger/touch" } string %Type { "Boolean" } string %Actions { "trigger_touch" } }
+  Component { string %Path { "/input/menu/click" } string %Hands { "left" } string %Type { "Boolean" } string %Actions { "menu_click" } }
+  Component { string %Path { "/input/squeeze/value" } string %Type { "Float" } string %Actions { "grip_value", "grip_click" } }
+  Component { string %Path { "/input/thumbstick" } string %Type { "Vector2" } string %Actions { "primary_analog_stick" } }
+  Component { string %Path { "/input/thumbstick/click" } string %Type { "Boolean" } string %Actions { "primary_analog_stick_click" } }
+  Component { string %Path { "/input/thumbstick/touch" } string %Type { "Boolean" } string %Actions { "primary_analog_stick_touch" } }
+  Component { string %Path { "/input/x/click" } string %Hands { "left" } string %Type { "Boolean" } string %Actions { "button_a" } }
+  Component { string %Path { "/input/x/touch" } string %Hands { "left" } string %Type { "Boolean" } string %Actions { "button_a_touch" } }
+  Component { string %Path { "/input/y/click" } string %Hands { "left" } string %Type { "Boolean" } string %Actions { "button_b" } }
+  Component { string %Path { "/input/y/touch" } string %Hands { "left" } string %Type { "Boolean" } string %Actions { "button_b_touch" } }
+  Component { string %Path { "/input/a/click" } string %Hands { "right" } string %Type { "Boolean" } string %Actions { "button_a" } }
+  Component { string %Path { "/input/a/touch" } string %Hands { "right" } string %Type { "Boolean" } string %Actions { "button_a_touch" } }
+  Component { string %Path { "/input/b/click" } string %Hands { "right" } string %Type { "Boolean" } string %Actions { "button_b" } }
+  Component { string %Path { "/input/b/touch" } string %Hands { "right" } string %Type { "Boolean" } string %Actions { "button_b_touch" } }
+  Component { string %Path { "/input/thumbrest/touch" } string %Type { "Boolean" } string %Actions { "thumbrest" } }
+  Component { string %Path { "/input/grip/pose" } string %Type { "Pose" } string %Actions { "grip_pose" } }
+  Component { string %Path { "/input/aim/pose" } string %Type { "Pose" } string %Actions { "aim_pose" } }
+  Component { string %Path { "/output/haptic" } string %Type { "Vibration" } string %Actions { "haptic" } }
+}
+)"
+    R"(
+Profile { string %Path { "/interaction_profiles/htc/vive_cosmos_controller" } string %DisplayName { "HTC Vive Cosmos" } string %Extension { "XR_HTC_vive_cosmos_controller_interaction" }
+  Component { string %Path { "/input/trigger/value" } string %Type { "Float" } string %Actions { "trigger_value" } }
+  Component { string %Path { "/input/trigger/click" } string %Type { "Boolean" } string %Actions { "select_click" } }
+  Component { string %Path { "/input/menu/click" } string %Hands { "left" } string %Type { "Boolean" } string %Actions { "menu_click" } }
+  Component { string %Path { "/input/squeeze/click" } string %Type { "Boolean" } string %Actions { "grip_click" } }
+  Component { string %Path { "/input/thumbstick" } string %Type { "Vector2" } string %Actions { "primary_analog_stick" } }
+  Component { string %Path { "/input/thumbstick/click" } string %Type { "Boolean" } string %Actions { "primary_analog_stick_click" } }
+  Component { string %Path { "/input/thumbstick/touch" } string %Type { "Boolean" } string %Actions { "primary_analog_stick_touch" } }
+  Component { string %Path { "/input/x/click" } string %Hands { "left" } string %Type { "Boolean" } string %Actions { "button_a" } }
+  Component { string %Path { "/input/y/click" } string %Hands { "left" } string %Type { "Boolean" } string %Actions { "button_b" } }
+  Component { string %Path { "/input/a/click" } string %Hands { "right" } string %Type { "Boolean" } string %Actions { "button_a" } }
+  Component { string %Path { "/input/b/click" } string %Hands { "right" } string %Type { "Boolean" } string %Actions { "button_b" } }
+  Component { string %Path { "/input/grip/pose" } string %Type { "Pose" } string %Actions { "grip_pose" } }
+  Component { string %Path { "/input/aim/pose" } string %Type { "Pose" } string %Actions { "aim_pose" } }
+  Component { string %Path { "/output/haptic" } string %Type { "Vibration" } string %Actions { "haptic" } }
+}
+Profile { string %Path { "/interaction_profiles/htc/vive_focus3_controller" } string %DisplayName { "HTC Vive Focus 3" } string %Extension { "XR_HTC_vive_focus3_controller_interaction" }
+  Component { string %Path { "/input/trigger/value" } string %Type { "Float" } string %Actions { "trigger_value" } }
+  Component { string %Path { "/input/trigger/click" } string %Type { "Boolean" } string %Actions { "select_click" } }
+  Component { string %Path { "/input/menu/click" } string %Hands { "left" } string %Type { "Boolean" } string %Actions { "menu_click" } }
+  Component { string %Path { "/input/squeeze/click" } string %Type { "Boolean" } string %Actions { "grip_click" } }
+  Component { string %Path { "/input/thumbstick" } string %Type { "Vector2" } string %Actions { "primary_analog_stick" } }
+  Component { string %Path { "/input/thumbstick/click" } string %Type { "Boolean" } string %Actions { "primary_analog_stick_click" } }
+  Component { string %Path { "/input/thumbstick/touch" } string %Type { "Boolean" } string %Actions { "primary_analog_stick_touch" } }
+  Component { string %Path { "/input/x/click" } string %Hands { "left" } string %Type { "Boolean" } string %Actions { "button_a" } }
+  Component { string %Path { "/input/y/click" } string %Hands { "left" } string %Type { "Boolean" } string %Actions { "button_b" } }
+  Component { string %Path { "/input/a/click" } string %Hands { "right" } string %Type { "Boolean" } string %Actions { "button_a" } }
+  Component { string %Path { "/input/b/click" } string %Hands { "right" } string %Type { "Boolean" } string %Actions { "button_b" } }
+  Component { string %Path { "/input/grip/pose" } string %Type { "Pose" } string %Actions { "grip_pose" } }
+  Component { string %Path { "/input/aim/pose" } string %Type { "Pose" } string %Actions { "aim_pose" } }
+  Component { string %Path { "/output/haptic" } string %Type { "Vibration" } string %Actions { "haptic" } }
+}
+Profile { string %Path { "/interaction_profiles/bytedance/pico_neo3_controller" } string %DisplayName { "Pico Neo3" } string %Extension { "XR_BD_controller_interaction" }
+  Component { string %Path { "/input/trigger/value" } string %Type { "Float" } string %Actions { "trigger_value" } }
+  Component { string %Path { "/input/trigger/click" } string %Type { "Boolean" } string %Actions { "select_click" } }
+  Component { string %Path { "/input/menu/click" } string %Hands { "left" } string %Type { "Boolean" } string %Actions { "menu_click" } }
+  Component { string %Path { "/input/squeeze/value" } string %Type { "Float" } string %Actions { "grip_value" } }
+  Component { string %Path { "/input/squeeze/click" } string %Type { "Boolean" } string %Actions { "grip_click" } }
+  Component { string %Path { "/input/thumbstick" } string %Type { "Vector2" } string %Actions { "primary_analog_stick" } }
+  Component { string %Path { "/input/thumbstick/click" } string %Type { "Boolean" } string %Actions { "primary_analog_stick_click" } }
+  Component { string %Path { "/input/thumbstick/touch" } string %Type { "Boolean" } string %Actions { "primary_analog_stick_touch" } }
+  Component { string %Path { "/input/x/click" } string %Hands { "left" } string %Type { "Boolean" } string %Actions { "button_a" } }
+  Component { string %Path { "/input/y/click" } string %Hands { "left" } string %Type { "Boolean" } string %Actions { "button_b" } }
+  Component { string %Path { "/input/a/click" } string %Hands { "right" } string %Type { "Boolean" } string %Actions { "button_a" } }
+  Component { string %Path { "/input/b/click" } string %Hands { "right" } string %Type { "Boolean" } string %Actions { "button_b" } }
+  Component { string %Path { "/input/grip/pose" } string %Type { "Pose" } string %Actions { "grip_pose" } }
+  Component { string %Path { "/input/aim/pose" } string %Type { "Pose" } string %Actions { "aim_pose" } }
+  Component { string %Path { "/output/haptic" } string %Type { "Vibration" } string %Actions { "haptic" } }
+}
+)";
 
-#define XR_Primary_Analog_Stick_Axis "primary_analog_stick"
-#define XR_Primary_Analog_Stick_Click "primary_analog_stick_click"
-#define XR_Primary_Analog_Stick_Touch "primary_analog_stick_touch"
+  /// Copies sName into an OpenXR action name: lower-case a-z, 0-9, '-', '_' and '.', shorter than XR_MAX_ACTION_NAME_SIZE.
+  void SanitizeActionName(plStringView sName, plStringBuilder& out_sName)
+  {
+    out_sName.Clear();
+    for (auto it = sName.GetIteratorFront(); it.IsValid(); ++it)
+    {
+      const plUInt32 c = plStringUtils::ToLowerChar(it.GetCharacter());
+      const bool bValid = (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.';
+      out_sName.Append(bValid ? c : static_cast<plUInt32>('_'));
+    }
 
-#define XR_Secondary_Analog_Stick_Axis "secondary_analog_stick"
-#define XR_Secondary_Analog_Stick_Click "secondary_analog_stick_click"
-#define XR_Secondary_Analog_Stick_Touch "secondary_analog_stick_touch"
+    if (out_sName.IsEmpty())
+      out_sName = "action";
 
-#define XR_Grip_Pose "grip_pose"
-#define XR_Aim_Pose "aim_pose"
+    if (out_sName.GetElementCount() >= XR_MAX_ACTION_NAME_SIZE)
+      out_sName.Shrink(0, out_sName.GetElementCount() - (XR_MAX_ACTION_NAME_SIZE - 1));
+  }
 
-#define XR_Haptic "haptic"
+  constexpr plStringView s_sHandPrefix[2] = {"/user/hand/left"_plsv, "/user/hand/right"_plsv};
+} // namespace
 
 void plOpenXRInputDevice::GetDeviceList(plHybridArray<plXRDeviceID, 64>& out_devices) const
 {
@@ -79,6 +282,9 @@ plXRDeviceID plOpenXRInputDevice::GetDeviceIDByType(plXRDeviceType::Enum type) c
       break;
     case plXRDeviceType::LeftShoulder:
       deviceID = m_iLeftShoulderDeviceId;
+      break;
+    case plXRDeviceType::EyeGaze:
+      deviceID = m_iEyeGazeDeviceId;
       break;
     default:
       deviceID = -1;
@@ -117,6 +323,49 @@ plBitflags<plXRDeviceFeatures> plOpenXRInputDevice::GetDeviceFeatures(plXRDevice
   return m_SupportedFeatures[deviceID];
 }
 
+plInt32 plOpenXRInputDevice::GetRenderModelSide(plXRDeviceID deviceID) const
+{
+  if (deviceID == m_iLeftControllerDeviceID)
+    return 0;
+  if (deviceID == m_iRightControllerDeviceID)
+    return 1;
+  return -1;
+}
+
+plString plOpenXRInputDevice::GetRenderModelKey(plXRDeviceID deviceID) const
+{
+  const plInt32 iSide = GetRenderModelSide(deviceID);
+  if (iSide < 0)
+    return {};
+
+  return m_RenderModel[iSide].m_sKey;
+}
+
+plResult plOpenXRInputDevice::TryGetRenderModel(plXRDeviceID deviceID, RenderModel& out_model) const
+{
+  const plInt32 iSide = GetRenderModelSide(deviceID);
+  if (iSide < 0 || m_RenderModel[iSide].m_sKey.IsEmpty() || m_RenderModel[iSide].m_Glb.IsEmpty())
+    return PL_FAILURE;
+
+  out_model = m_RenderModel[iSide];
+  return PL_SUCCESS;
+}
+
+plResult plOpenXRInputDevice::TryGetRenderModelNodePoses(plXRDeviceID deviceID, plDynamicArray<RenderModelNodePose>& out_poses) const
+{
+  const plInt32 iSide = GetRenderModelSide(deviceID);
+  if (iSide < 0 || m_RenderModel[iSide].m_sKey.IsEmpty())
+    return PL_FAILURE;
+
+  // The poses belong to one model; while the input thread already animates a newer one than the main thread holds,
+  // they would address the wrong nodes.
+  if (m_sRenderModelNodePoseKey[iSide] != m_RenderModel[iSide].m_sKey || m_RenderModelNodePoses[iSide].IsEmpty())
+    return PL_FAILURE;
+
+  out_poses = m_RenderModelNodePoses[iSide];
+  return PL_SUCCESS;
+}
+
 plOpenXRInputDevice::plOpenXRInputDevice(plOpenXR* pOpenXR)
   : plXRInputDevice()
   , m_pOpenXR(pOpenXR)
@@ -126,6 +375,8 @@ plOpenXRInputDevice::plOpenXRInputDevice(plOpenXR* pOpenXR)
 
 XrResult plOpenXRInputDevice::CreateActions(XrSession session, XrSpace sceneSpace)
 {
+  // The input device outlives the instance when the runtime loses it and plOpenXR creates a new one.
+  m_pInstance = m_pOpenXR->m_pInstance;
   m_pSession = session;
 
   // Latch the batched-location choice for this session - see the member comment for why the input thread
@@ -143,11 +394,17 @@ XrResult plOpenXRInputDevice::CreateActions(XrSession session, XrSpace sceneSpac
   m_SupportedFeatures[0] = plXRDeviceFeatures::AimPose | plXRDeviceFeatures::GripPose;
 
   // Devices
-  for (plUInt32 uiControllerId : {m_iLeftControllerDeviceID, m_iRightControllerDeviceID, m_iLeftShoulderDeviceId})
+  for (plUInt32 uiControllerId : {m_iLeftControllerDeviceID, m_iRightControllerDeviceID, m_iLeftShoulderDeviceId, m_iEyeGazeDeviceId})
   {
     m_DeviceState[uiControllerId] = plXRDeviceState();
     m_sActiveProfile[uiControllerId].Clear();
   }
+
+  // The input thread is not running yet, so the working snapshot can be set up here.
+  m_WorkingSnapshot.m_DeviceState[m_iLeftControllerDeviceID].m_Type = plXRDeviceType::LeftController;
+  m_WorkingSnapshot.m_DeviceState[m_iRightControllerDeviceID].m_Type = plXRDeviceType::RightController;
+  m_WorkingSnapshot.m_DeviceState[m_iLeftShoulderDeviceId].m_Type = plXRDeviceType::LeftShoulder;
+  m_WorkingSnapshot.m_DeviceState[m_iEyeGazeDeviceId].m_Type = plXRDeviceType::EyeGaze;
 
   XrActionSetCreateInfo actionSetInfo{XR_TYPE_ACTION_SET_CREATE_INFO};
   plStringUtils::Copy(actionSetInfo.actionSetName, XR_MAX_ACTION_SET_NAME_SIZE, "gameplay");
@@ -168,80 +425,46 @@ XrResult plOpenXRInputDevice::CreateActions(XrSession session, XrSpace sceneSpac
   m_SubActionPathVive[1] = CreatePath("/user/vive_tracker_htcx/role/left_shoulder");
   m_SubActionPathVive[2] = CreatePath("/user/vive_tracker_htcx/role/left_shoulder/input/grip/pose");
 
-  // Deice Tracker Inputs
-  XrAction LeftShoulder = XR_NULL_HANDLE;
+  // The input thread is not running yet, so its render model state can be reset here.
+  ResetRenderModels();
+  if (m_pOpenXR->m_Extensions.m_bRenderModelFB)
+  {
+    m_RenderModelPathFB[0] = CreatePath("/model_fb/controller/left");
+    m_RenderModelPathFB[1] = CreatePath("/model_fb/controller/right");
+  }
 
-  // Float inputs
-  XrAction Trigger = XR_NULL_HANDLE;
-  XrAction Grip = XR_NULL_HANDLE;
+  // XR.DpadBinding needs XR.BindingModification, which carries the dpad structs. Both cvars and XR.PalmPose are latched
+  // here: they change what the session is handed, so a toggle mid-session must not reach the input thread.
+  m_bUseDpadBinding = cvar_XrBindingModification && cvar_XrDpadBinding && m_pOpenXR->m_Extensions.m_bBindingModification && m_pOpenXR->m_Extensions.m_bDpadBinding;
+  m_bUsePalmPose = cvar_XrPalmPose && m_pOpenXR->m_Extensions.m_bPalmPose;
+  m_bGlyphsDirty = false;
 
-  // Boolean inputs
-  XrAction TriggerTouch = XR_NULL_HANDLE;
-  XrAction SelectClick = XR_NULL_HANDLE;
-  XrAction MenuClick = XR_NULL_HANDLE;
-  XrAction GripClick = XR_NULL_HANDLE;
-  XrAction ButtonA = XR_NULL_HANDLE;
-  XrAction ButtonATouch = XR_NULL_HANDLE;
-  XrAction ButtonB = XR_NULL_HANDLE;
-  XrAction ButtonBTouch = XR_NULL_HANDLE;
-  XrAction Thumbrest = XR_NULL_HANDLE;
+  LoadInteractionProfiles();
 
-  // Analog stick inputs
-  XrAction PrimaryAnalogStickAxis = XR_NULL_HANDLE;
-  XrAction PrimaryAnalogStickClick = XR_NULL_HANDLE;
-  XrAction PrimaryAnalogStickTouch = XR_NULL_HANDLE;
+  // The built-in actions behind the xr_hand_<side>_* input slots, by name for the profile table.
+  plHashTable<plString, XrAction> builtInActions;
+  for (const BuiltInAction& builtIn : s_BuiltInActions)
+  {
+    XrAction action = XR_NULL_HANDLE;
+    XR_SUCCEED_OR_CLEANUP_LOG(CreateAction(builtIn.m_Feature, builtIn.m_szName, builtIn.m_Type, action), DestroyActions);
+    builtInActions.Insert(plString(builtIn.m_szName), action);
+  }
 
-  XrAction SecondaryAnalogStickAxis = XR_NULL_HANDLE;
-  XrAction SecondaryAnalogStickClick = XR_NULL_HANDLE;
-  XrAction SecondaryAnalogStickTouch = XR_NULL_HANDLE;
-
-  // Pose inputs
   XrAction GripPose = XR_NULL_HANDLE;
   XrAction AimPose = XR_NULL_HANDLE;
+  builtInActions.TryGetValue("grip_pose", GripPose);
+  builtInActions.TryGetValue("aim_pose", AimPose);
+  builtInActions.TryGetValue("haptic", m_HapticAction);
 
-  
-  // Create float actions
-  XR_SUCCEED_OR_CLEANUP_LOG(CreateAction(plXRDeviceFeatures::Trigger, XR_Trigger, XR_ACTION_TYPE_FLOAT_INPUT, Trigger), DestroyActions);
-  XR_SUCCEED_OR_CLEANUP_LOG(CreateAction(plXRDeviceFeatures::Grip, XR_Grip, XR_ACTION_TYPE_FLOAT_INPUT, Grip), DestroyActions);
+  // Palm pose. Not in the profile table: the extension adds the same component to every controller profile, so it is
+  // suggested next to each grip pose and dropped wherever the runtime rejects it.
+  if (m_bUsePalmPose)
+  {
+    XR_SUCCEED_OR_CLEANUP_LOG(CreateAction(plXRDeviceFeatures::PalmPose, "palm_pose", XR_ACTION_TYPE_POSE_INPUT, m_PalmPoseAction), DestroyActions);
+    plLog::Info("OpenXR: XR.PalmPose is on; the palm is reported as the third pose of each hand.");
+  }
 
-  // Create boolean actions
-  XR_SUCCEED_OR_CLEANUP_LOG(CreateAction(plXRDeviceFeatures::TriggerTouch, XR_Trigger_Touch, XR_ACTION_TYPE_BOOLEAN_INPUT, TriggerTouch), DestroyActions);
-  XR_SUCCEED_OR_CLEANUP_LOG(CreateAction(plXRDeviceFeatures::Select, XR_Select_Click, XR_ACTION_TYPE_BOOLEAN_INPUT, SelectClick), DestroyActions);
-  XR_SUCCEED_OR_CLEANUP_LOG(CreateAction(plXRDeviceFeatures::Menu, XR_Menu_Click, XR_ACTION_TYPE_BOOLEAN_INPUT, MenuClick), DestroyActions);
-  XR_SUCCEED_OR_CLEANUP_LOG(CreateAction(plXRDeviceFeatures::GripClick, XR_Grip_Click, XR_ACTION_TYPE_BOOLEAN_INPUT, GripClick), DestroyActions);
-  XR_SUCCEED_OR_CLEANUP_LOG(CreateAction(plXRDeviceFeatures::ButtonA, XR_Button_A, XR_ACTION_TYPE_BOOLEAN_INPUT, ButtonA), DestroyActions);
-  XR_SUCCEED_OR_CLEANUP_LOG(CreateAction(plXRDeviceFeatures::ButtonATouch, XR_Button_A_Touch, XR_ACTION_TYPE_BOOLEAN_INPUT, ButtonATouch), DestroyActions);
-  XR_SUCCEED_OR_CLEANUP_LOG(CreateAction(plXRDeviceFeatures::ButtonB, XR_Button_B, XR_ACTION_TYPE_BOOLEAN_INPUT, ButtonB), DestroyActions);
-  XR_SUCCEED_OR_CLEANUP_LOG(CreateAction(plXRDeviceFeatures::ButtonBTouch, XR_Button_B_Touch, XR_ACTION_TYPE_BOOLEAN_INPUT, ButtonBTouch), DestroyActions);
-  XR_SUCCEED_OR_CLEANUP_LOG(CreateAction(plXRDeviceFeatures::Thumbrest, XR_Thumbrest, XR_ACTION_TYPE_BOOLEAN_INPUT, Thumbrest), DestroyActions);
-
-  // Create analog stick actions
-  XR_SUCCEED_OR_CLEANUP_LOG(
-    CreateAction(plXRDeviceFeatures::PrimaryAnalogStick, XR_Primary_Analog_Stick_Axis, XR_ACTION_TYPE_VECTOR2F_INPUT, PrimaryAnalogStickAxis),
-    DestroyActions);
-  XR_SUCCEED_OR_CLEANUP_LOG(
-    CreateAction(plXRDeviceFeatures::PrimaryAnalogStickClick, XR_Primary_Analog_Stick_Click, XR_ACTION_TYPE_BOOLEAN_INPUT, PrimaryAnalogStickClick),
-    DestroyActions);
-  XR_SUCCEED_OR_CLEANUP_LOG(
-    CreateAction(plXRDeviceFeatures::PrimaryAnalogStickTouch, XR_Primary_Analog_Stick_Touch, XR_ACTION_TYPE_BOOLEAN_INPUT, PrimaryAnalogStickTouch),
-    DestroyActions);
-
-  XR_SUCCEED_OR_CLEANUP_LOG(
-    CreateAction(plXRDeviceFeatures::SecondaryAnalogStick, XR_Secondary_Analog_Stick_Axis, XR_ACTION_TYPE_VECTOR2F_INPUT, SecondaryAnalogStickAxis),
-    DestroyActions);
-  XR_SUCCEED_OR_CLEANUP_LOG(CreateAction(plXRDeviceFeatures::SecondaryAnalogStickClick, XR_Secondary_Analog_Stick_Click, XR_ACTION_TYPE_BOOLEAN_INPUT,
-                              SecondaryAnalogStickClick),
-    DestroyActions);
-  XR_SUCCEED_OR_CLEANUP_LOG(CreateAction(plXRDeviceFeatures::SecondaryAnalogStickTouch, XR_Secondary_Analog_Stick_Touch, XR_ACTION_TYPE_BOOLEAN_INPUT,
-                              SecondaryAnalogStickTouch),
-    DestroyActions);
-
-  // Create pose actions
-  XR_SUCCEED_OR_CLEANUP_LOG(CreateAction(plXRDeviceFeatures::GripPose, XR_Grip_Pose, XR_ACTION_TYPE_POSE_INPUT, GripPose), DestroyActions);
-  XR_SUCCEED_OR_CLEANUP_LOG(CreateAction(plXRDeviceFeatures::AimPose, XR_Aim_Pose, XR_ACTION_TYPE_POSE_INPUT, AimPose), DestroyActions);
-
-  // Create the vibration output action
-  XR_SUCCEED_OR_CLEANUP_LOG(CreateAction(plXRDeviceFeatures::Haptics, XR_Haptic, XR_ACTION_TYPE_VIBRATION_OUTPUT, m_HapticAction), DestroyActions);
+  CreateMapActions();
 
   // Left-shoulder tracker pose. Not created through CreateAction: it has no input slots and uses the tracker's
   // subaction path instead of the hands'.
@@ -257,374 +480,24 @@ XrResult plOpenXRInputDevice::CreateActions(XrSession session, XrSpace sceneSpac
     XR_SUCCEED_OR_CLEANUP_LOG(xrCreateAction(m_pActionSet, &actionInfo, &shoulderPoseAction), DestroyActions);
   }
 
-  //=============================================================================
-  // INTERACTION PROFILE BINDINGS
-  // Each controller type has its own profile with appropriate bindings.
-  // The goal is to provide a unified experience across all controllers:
-  // - Primary stick/trackpad = movement
-  // - Trigger = main action
-  // - Grip = grab/hold
-  // - Face buttons = context-dependent actions
-  //=============================================================================
-
-  // KHR Simple Controller (fallback for any controller)
-  Bind simpleController[] = {
-    {SelectClick, "/user/hand/left/input/select/click"},
-    {MenuClick, "/user/hand/left/input/menu/click"},
-    {GripPose, "/user/hand/left/input/grip/pose"},
-    {AimPose, "/user/hand/left/input/aim/pose"},
-
-    {SelectClick, "/user/hand/right/input/select/click"},
-    {MenuClick, "/user/hand/right/input/menu/click"},
-    {GripPose, "/user/hand/right/input/grip/pose"},
-    {AimPose, "/user/hand/right/input/aim/pose"},
-
-    {m_HapticAction, "/user/hand/left/output/haptic"},
-    {m_HapticAction, "/user/hand/right/output/haptic"},
-  };
-  SuggestInteractionProfileBindings("/interaction_profiles/khr/simple_controller", "Simple Controller", simpleController);
-
-  // Microsoft Mixed Reality Motion Controller
-  // Has thumbstick (primary) and trackpad (secondary)
-  Bind motionController[] = {
-    {Trigger, "/user/hand/left/input/trigger/value"},
-    {SelectClick, "/user/hand/left/input/trigger/value"},
-    {MenuClick, "/user/hand/left/input/menu/click"},
-    {Grip, "/user/hand/left/input/squeeze/click"},
-    {GripClick, "/user/hand/left/input/squeeze/click"},
-    {PrimaryAnalogStickAxis, "/user/hand/left/input/thumbstick"},
-    {PrimaryAnalogStickClick, "/user/hand/left/input/thumbstick/click"},
-    {SecondaryAnalogStickAxis, "/user/hand/left/input/trackpad"},
-    {SecondaryAnalogStickClick, "/user/hand/left/input/trackpad/click"},
-    {SecondaryAnalogStickTouch, "/user/hand/left/input/trackpad/touch"},
-    {GripPose, "/user/hand/left/input/grip/pose"},
-    {AimPose, "/user/hand/left/input/aim/pose"},
-
-    {Trigger, "/user/hand/right/input/trigger/value"},
-    {SelectClick, "/user/hand/right/input/trigger/value"},
-    {MenuClick, "/user/hand/right/input/menu/click"},
-    {Grip, "/user/hand/right/input/squeeze/click"},
-    {GripClick, "/user/hand/right/input/squeeze/click"},
-    {PrimaryAnalogStickAxis, "/user/hand/right/input/thumbstick"},
-    {PrimaryAnalogStickClick, "/user/hand/right/input/thumbstick/click"},
-    {SecondaryAnalogStickAxis, "/user/hand/right/input/trackpad"},
-    {SecondaryAnalogStickClick, "/user/hand/right/input/trackpad/click"},
-    {SecondaryAnalogStickTouch, "/user/hand/right/input/trackpad/touch"},
-    {GripPose, "/user/hand/right/input/grip/pose"},
-    {AimPose, "/user/hand/right/input/aim/pose"},
-
-    {m_HapticAction, "/user/hand/left/output/haptic"},
-    {m_HapticAction, "/user/hand/right/output/haptic"},
-  };
-  SuggestInteractionProfileBindings("/interaction_profiles/microsoft/motion_controller", "Mixed Reality Motion Controller", motionController);
-
-  // Oculus Touch Controller (Meta Quest 1/2/3/Pro, Rift, Rift S)
-  // Full featured controller with thumbstick, trigger, grip, and face buttons
-  // Left: X/Y buttons, Right: A/B buttons
-  Bind oculusTouchController[] = {
-    // Left hand
-    {Trigger, "/user/hand/left/input/trigger/value"},
-    {TriggerTouch, "/user/hand/left/input/trigger/touch"},
-    {SelectClick, "/user/hand/left/input/trigger/value"},
-    {MenuClick, "/user/hand/left/input/menu/click"},
-    {Grip, "/user/hand/left/input/squeeze/value"},
-    {GripClick, "/user/hand/left/input/squeeze/value"},
-    {PrimaryAnalogStickAxis, "/user/hand/left/input/thumbstick"},
-    {PrimaryAnalogStickClick, "/user/hand/left/input/thumbstick/click"},
-    {PrimaryAnalogStickTouch, "/user/hand/left/input/thumbstick/touch"},
-    {ButtonA, "/user/hand/left/input/x/click"}, // X button = Button A on left
-    {ButtonATouch, "/user/hand/left/input/x/touch"},
-    {ButtonB, "/user/hand/left/input/y/click"}, // Y button = Button B on left
-    {ButtonBTouch, "/user/hand/left/input/y/touch"},
-    {Thumbrest, "/user/hand/left/input/thumbrest/touch"},
-    {GripPose, "/user/hand/left/input/grip/pose"},
-    {AimPose, "/user/hand/left/input/aim/pose"},
-
-    // Right hand
-    {Trigger, "/user/hand/right/input/trigger/value"},
-    {TriggerTouch, "/user/hand/right/input/trigger/touch"},
-    {SelectClick, "/user/hand/right/input/trigger/value"},
-    {Grip, "/user/hand/right/input/squeeze/value"},
-    {GripClick, "/user/hand/right/input/squeeze/value"},
-    {PrimaryAnalogStickAxis, "/user/hand/right/input/thumbstick"},
-    {PrimaryAnalogStickClick, "/user/hand/right/input/thumbstick/click"},
-    {PrimaryAnalogStickTouch, "/user/hand/right/input/thumbstick/touch"},
-    {ButtonA, "/user/hand/right/input/a/click"},
-    {ButtonATouch, "/user/hand/right/input/a/touch"},
-    {ButtonB, "/user/hand/right/input/b/click"},
-    {ButtonBTouch, "/user/hand/right/input/b/touch"},
-    {Thumbrest, "/user/hand/right/input/thumbrest/touch"},
-    {GripPose, "/user/hand/right/input/grip/pose"},
-    {AimPose, "/user/hand/right/input/aim/pose"},
-
-    {m_HapticAction, "/user/hand/left/output/haptic"},
-    {m_HapticAction, "/user/hand/right/output/haptic"},
-  };
-  SuggestInteractionProfileBindings("/interaction_profiles/oculus/touch_controller", "Oculus Touch Controller", oculusTouchController);
-
-  // Valve Index Controller (Knuckles)
-  // Has thumbstick (primary), trackpad (secondary), and A/B buttons
-  // Also has per-finger tracking via capacitive sensors and force grip
-  Bind valveIndexController[] = {
-    // Left hand
-    {Trigger, "/user/hand/left/input/trigger/value"},
-    {TriggerTouch, "/user/hand/left/input/trigger/touch"},
-    {SelectClick, "/user/hand/left/input/trigger/click"},
-    {Grip, "/user/hand/left/input/squeeze/value"},
-    {GripClick, "/user/hand/left/input/squeeze/force"}, // Index has force-sensitive grip
-    {PrimaryAnalogStickAxis, "/user/hand/left/input/thumbstick"},
-    {PrimaryAnalogStickClick, "/user/hand/left/input/thumbstick/click"},
-    {PrimaryAnalogStickTouch, "/user/hand/left/input/thumbstick/touch"},
-    {SecondaryAnalogStickAxis, "/user/hand/left/input/trackpad"},
-    {SecondaryAnalogStickTouch, "/user/hand/left/input/trackpad/touch"},
-    {ButtonA, "/user/hand/left/input/a/click"},
-    {ButtonATouch, "/user/hand/left/input/a/touch"},
-    {ButtonB, "/user/hand/left/input/b/click"},
-    {ButtonBTouch, "/user/hand/left/input/b/touch"},
-    {Thumbrest, "/user/hand/left/input/thumbstick/touch"}, // Use thumbstick touch as thumbrest
-    {GripPose, "/user/hand/left/input/grip/pose"},
-    {AimPose, "/user/hand/left/input/aim/pose"},
-
-    // Right hand
-    {Trigger, "/user/hand/right/input/trigger/value"},
-    {TriggerTouch, "/user/hand/right/input/trigger/touch"},
-    {SelectClick, "/user/hand/right/input/trigger/click"},
-    {Grip, "/user/hand/right/input/squeeze/value"},
-    {GripClick, "/user/hand/right/input/squeeze/force"},
-    {PrimaryAnalogStickAxis, "/user/hand/right/input/thumbstick"},
-    {PrimaryAnalogStickClick, "/user/hand/right/input/thumbstick/click"},
-    {PrimaryAnalogStickTouch, "/user/hand/right/input/thumbstick/touch"},
-    {SecondaryAnalogStickAxis, "/user/hand/right/input/trackpad"},
-    {SecondaryAnalogStickTouch, "/user/hand/right/input/trackpad/touch"},
-    {ButtonA, "/user/hand/right/input/a/click"},
-    {ButtonATouch, "/user/hand/right/input/a/touch"},
-    {ButtonB, "/user/hand/right/input/b/click"},
-    {ButtonBTouch, "/user/hand/right/input/b/touch"},
-    {Thumbrest, "/user/hand/right/input/thumbstick/touch"},
-    {GripPose, "/user/hand/right/input/grip/pose"},
-    {AimPose, "/user/hand/right/input/aim/pose"},
-
-    {m_HapticAction, "/user/hand/left/output/haptic"},
-    {m_HapticAction, "/user/hand/right/output/haptic"},
-  };
-  SuggestInteractionProfileBindings("/interaction_profiles/valve/index_controller", "Valve Index Controller", valveIndexController);
-
-  // HTC Vive Controller (Wands)
-  // Has only trackpad (bound as primary since no thumbstick), trigger, grip, and menu
-
-  Bind htcViveController[] = {
-    // Left hand
-    {Trigger, "/user/hand/left/input/trigger/value"},
-    {SelectClick, "/user/hand/left/input/trigger/click"},
-    {MenuClick, "/user/hand/left/input/menu/click"},
-    {GripClick, "/user/hand/left/input/squeeze/click"},         // Vive grip is click only, no analog
-    {PrimaryAnalogStickAxis, "/user/hand/left/input/trackpad"}, // Trackpad as primary
-    {PrimaryAnalogStickClick, "/user/hand/left/input/trackpad/click"},
-    {PrimaryAnalogStickTouch, "/user/hand/left/input/trackpad/touch"},
-    {GripPose, "/user/hand/left/input/grip/pose"},
-    {AimPose, "/user/hand/left/input/aim/pose"},
-
-    // Right hand
-    {Trigger, "/user/hand/right/input/trigger/value"},
-    {SelectClick, "/user/hand/right/input/trigger/click"},
-    {MenuClick, "/user/hand/right/input/menu/click"},
-    {GripClick, "/user/hand/right/input/squeeze/click"},
-    {PrimaryAnalogStickAxis, "/user/hand/right/input/trackpad"},
-    {PrimaryAnalogStickClick, "/user/hand/right/input/trackpad/click"},
-    {PrimaryAnalogStickTouch, "/user/hand/right/input/trackpad/touch"},
-    {GripPose, "/user/hand/right/input/grip/pose"},
-    {AimPose, "/user/hand/right/input/aim/pose"},
-
-    {m_HapticAction, "/user/hand/left/output/haptic"},
-    {m_HapticAction, "/user/hand/right/output/haptic"},
-  };
-  SuggestInteractionProfileBindings("/interaction_profiles/htc/vive_controller", "HTC Vive Controller", htcViveController);
-
-  // Microsoft Hand Interaction (hand tracking without controllers)
-  if (m_pOpenXR->m_Extensions.m_bHandInteraction)
+  // Eye gaze pose. No subaction paths: /user/eyes_ext is the only path it binds to.
+  const bool bEyeGaze = m_pOpenXR->m_Extensions.m_bEyeGaze && m_pOpenXR->m_Info.m_bSupportsEyeGaze;
+  if (bEyeGaze)
   {
-    Bind handInteraction[] = {
-      {SelectClick, "/user/hand/left/input/select/value"},
-      {Grip, "/user/hand/left/input/squeeze/value"},
-      {GripPose, "/user/hand/left/input/grip/pose"},
-      {AimPose, "/user/hand/left/input/aim/pose"},
-
-      {SelectClick, "/user/hand/right/input/select/value"},
-      {Grip, "/user/hand/right/input/squeeze/value"},
-      {GripPose, "/user/hand/right/input/grip/pose"},
-      {AimPose, "/user/hand/right/input/aim/pose"},
-    };
-    SuggestInteractionProfileBindings("/interaction_profiles/microsoft/hand_interaction", "Hand Interaction", handInteraction);
+    XrActionCreateInfo actionInfo{XR_TYPE_ACTION_CREATE_INFO};
+    actionInfo.actionType = XR_ACTION_TYPE_POSE_INPUT;
+    plStringUtils::Copy(actionInfo.actionName, XR_MAX_ACTION_NAME_SIZE, "eye_gaze_pose");
+    plStringUtils::Copy(actionInfo.localizedActionName, XR_MAX_LOCALIZED_ACTION_NAME_SIZE, "Eye Gaze Pose");
+    actionInfo.countSubactionPaths = 0;
+    actionInfo.subactionPaths = nullptr;
+    XR_SUCCEED_OR_CLEANUP_LOG(xrCreateAction(m_pActionSet, &actionInfo, &m_EyeGazeAction), DestroyActions);
   }
 
-  //=============================================================================
-  // EXTENSION INTERACTION PROFILES
-  // These profile paths only exist if the runtime enabled the matching extension
-  // (XR_EXT_hand_interaction, XR_FB_touch_controller_pro,
-  // XR_HTC_vive_cosmos_controller_interaction, XR_HTC_vive_focus3_controller_interaction,
-  // XR_BD_controller_interaction). They are suggested as optional so a runtime
-  // without them reports info instead of an error.
-  //=============================================================================
-
-  // EXT Hand Interaction (articulated hands, no controller and no haptics)
-  Bind extHandInteraction[] = {
-    {Trigger, "/user/hand/left/input/aim_activate_ext/value"},
-    {SelectClick, "/user/hand/left/input/aim_activate_ext/value"},
-    {Grip, "/user/hand/left/input/grasp_ext/value"},
-    {GripClick, "/user/hand/left/input/grasp_ext/value"},
-    {GripPose, "/user/hand/left/input/grip/pose"},
-    {AimPose, "/user/hand/left/input/aim/pose"},
-
-    {Trigger, "/user/hand/right/input/aim_activate_ext/value"},
-    {SelectClick, "/user/hand/right/input/aim_activate_ext/value"},
-    {Grip, "/user/hand/right/input/grasp_ext/value"},
-    {GripClick, "/user/hand/right/input/grasp_ext/value"},
-    {GripPose, "/user/hand/right/input/grip/pose"},
-    {AimPose, "/user/hand/right/input/aim/pose"},
-  };
-  SuggestInteractionProfileBindings("/interaction_profiles/ext/hand_interaction_ext", "Hand Interaction", extHandInteraction, true);
-
-  // Meta Quest Touch Pro
-  // Superset of the Oculus Touch controller, so the same layout is used.
-  Bind touchControllerPro[] = {
-    // Left hand
-    {Trigger, "/user/hand/left/input/trigger/value"},
-    {TriggerTouch, "/user/hand/left/input/trigger/touch"},
-    {SelectClick, "/user/hand/left/input/trigger/value"},
-    {MenuClick, "/user/hand/left/input/menu/click"},
-    {Grip, "/user/hand/left/input/squeeze/value"},
-    {GripClick, "/user/hand/left/input/squeeze/value"},
-    {PrimaryAnalogStickAxis, "/user/hand/left/input/thumbstick"},
-    {PrimaryAnalogStickClick, "/user/hand/left/input/thumbstick/click"},
-    {PrimaryAnalogStickTouch, "/user/hand/left/input/thumbstick/touch"},
-    {ButtonA, "/user/hand/left/input/x/click"},
-    {ButtonATouch, "/user/hand/left/input/x/touch"},
-    {ButtonB, "/user/hand/left/input/y/click"},
-    {ButtonBTouch, "/user/hand/left/input/y/touch"},
-    {Thumbrest, "/user/hand/left/input/thumbrest/touch"},
-    {GripPose, "/user/hand/left/input/grip/pose"},
-    {AimPose, "/user/hand/left/input/aim/pose"},
-
-    // Right hand
-    {Trigger, "/user/hand/right/input/trigger/value"},
-    {TriggerTouch, "/user/hand/right/input/trigger/touch"},
-    {SelectClick, "/user/hand/right/input/trigger/value"},
-    {Grip, "/user/hand/right/input/squeeze/value"},
-    {GripClick, "/user/hand/right/input/squeeze/value"},
-    {PrimaryAnalogStickAxis, "/user/hand/right/input/thumbstick"},
-    {PrimaryAnalogStickClick, "/user/hand/right/input/thumbstick/click"},
-    {PrimaryAnalogStickTouch, "/user/hand/right/input/thumbstick/touch"},
-    {ButtonA, "/user/hand/right/input/a/click"},
-    {ButtonATouch, "/user/hand/right/input/a/touch"},
-    {ButtonB, "/user/hand/right/input/b/click"},
-    {ButtonBTouch, "/user/hand/right/input/b/touch"},
-    {Thumbrest, "/user/hand/right/input/thumbrest/touch"},
-    {GripPose, "/user/hand/right/input/grip/pose"},
-    {AimPose, "/user/hand/right/input/aim/pose"},
-
-    {m_HapticAction, "/user/hand/left/output/haptic"},
-    {m_HapticAction, "/user/hand/right/output/haptic"},
-  };
-  SuggestInteractionProfileBindings("/interaction_profiles/facebook/touch_controller_pro", "Meta Quest Touch Pro", touchControllerPro, true);
-
-  // HTC Vive Cosmos Controller
-  // Thumbstick plus X/Y (left) and A/B (right) buttons, grip is click only.
-  Bind viveCosmosController[] = {
-    // Left hand
-    {Trigger, "/user/hand/left/input/trigger/value"},
-    {SelectClick, "/user/hand/left/input/trigger/click"},
-    {MenuClick, "/user/hand/left/input/menu/click"},
-    {GripClick, "/user/hand/left/input/squeeze/click"},
-    {PrimaryAnalogStickAxis, "/user/hand/left/input/thumbstick"},
-    {PrimaryAnalogStickClick, "/user/hand/left/input/thumbstick/click"},
-    {PrimaryAnalogStickTouch, "/user/hand/left/input/thumbstick/touch"},
-    {ButtonA, "/user/hand/left/input/x/click"},
-    {ButtonB, "/user/hand/left/input/y/click"},
-    {GripPose, "/user/hand/left/input/grip/pose"},
-    {AimPose, "/user/hand/left/input/aim/pose"},
-
-    // Right hand
-    {Trigger, "/user/hand/right/input/trigger/value"},
-    {SelectClick, "/user/hand/right/input/trigger/click"},
-    {GripClick, "/user/hand/right/input/squeeze/click"},
-    {PrimaryAnalogStickAxis, "/user/hand/right/input/thumbstick"},
-    {PrimaryAnalogStickClick, "/user/hand/right/input/thumbstick/click"},
-    {PrimaryAnalogStickTouch, "/user/hand/right/input/thumbstick/touch"},
-    {ButtonA, "/user/hand/right/input/a/click"},
-    {ButtonB, "/user/hand/right/input/b/click"},
-    {GripPose, "/user/hand/right/input/grip/pose"},
-    {AimPose, "/user/hand/right/input/aim/pose"},
-
-    {m_HapticAction, "/user/hand/left/output/haptic"},
-    {m_HapticAction, "/user/hand/right/output/haptic"},
-  };
-  SuggestInteractionProfileBindings("/interaction_profiles/htc/vive_cosmos_controller", "HTC Vive Cosmos", viveCosmosController, true);
-
-  // HTC Vive Focus 3 Controller
-  Bind viveFocus3Controller[] = {
-    // Left hand
-    {Trigger, "/user/hand/left/input/trigger/value"},
-    {SelectClick, "/user/hand/left/input/trigger/click"},
-    {MenuClick, "/user/hand/left/input/menu/click"},
-    {GripClick, "/user/hand/left/input/squeeze/click"},
-    {PrimaryAnalogStickAxis, "/user/hand/left/input/thumbstick"},
-    {PrimaryAnalogStickClick, "/user/hand/left/input/thumbstick/click"},
-    {PrimaryAnalogStickTouch, "/user/hand/left/input/thumbstick/touch"},
-    {ButtonA, "/user/hand/left/input/x/click"},
-    {ButtonB, "/user/hand/left/input/y/click"},
-    {GripPose, "/user/hand/left/input/grip/pose"},
-    {AimPose, "/user/hand/left/input/aim/pose"},
-
-    // Right hand
-    {Trigger, "/user/hand/right/input/trigger/value"},
-    {SelectClick, "/user/hand/right/input/trigger/click"},
-    {GripClick, "/user/hand/right/input/squeeze/click"},
-    {PrimaryAnalogStickAxis, "/user/hand/right/input/thumbstick"},
-    {PrimaryAnalogStickClick, "/user/hand/right/input/thumbstick/click"},
-    {PrimaryAnalogStickTouch, "/user/hand/right/input/thumbstick/touch"},
-    {ButtonA, "/user/hand/right/input/a/click"},
-    {ButtonB, "/user/hand/right/input/b/click"},
-    {GripPose, "/user/hand/right/input/grip/pose"},
-    {AimPose, "/user/hand/right/input/aim/pose"},
-
-    {m_HapticAction, "/user/hand/left/output/haptic"},
-    {m_HapticAction, "/user/hand/right/output/haptic"},
-  };
-  SuggestInteractionProfileBindings("/interaction_profiles/htc/vive_focus3_controller", "HTC Vive Focus 3", viveFocus3Controller, true);
-
-  // Pico Neo3 Controller
-  Bind picoNeo3Controller[] = {
-    // Left hand
-    {Trigger, "/user/hand/left/input/trigger/value"},
-    {SelectClick, "/user/hand/left/input/trigger/click"},
-    {MenuClick, "/user/hand/left/input/menu/click"},
-    {Grip, "/user/hand/left/input/squeeze/value"},
-    {GripClick, "/user/hand/left/input/squeeze/click"},
-    {PrimaryAnalogStickAxis, "/user/hand/left/input/thumbstick"},
-    {PrimaryAnalogStickClick, "/user/hand/left/input/thumbstick/click"},
-    {PrimaryAnalogStickTouch, "/user/hand/left/input/thumbstick/touch"},
-    {ButtonA, "/user/hand/left/input/x/click"},
-    {ButtonB, "/user/hand/left/input/y/click"},
-    {GripPose, "/user/hand/left/input/grip/pose"},
-    {AimPose, "/user/hand/left/input/aim/pose"},
-
-    // Right hand
-    {Trigger, "/user/hand/right/input/trigger/value"},
-    {SelectClick, "/user/hand/right/input/trigger/click"},
-    {Grip, "/user/hand/right/input/squeeze/value"},
-    {GripClick, "/user/hand/right/input/squeeze/click"},
-    {PrimaryAnalogStickAxis, "/user/hand/right/input/thumbstick"},
-    {PrimaryAnalogStickClick, "/user/hand/right/input/thumbstick/click"},
-    {PrimaryAnalogStickTouch, "/user/hand/right/input/thumbstick/touch"},
-    {ButtonA, "/user/hand/right/input/a/click"},
-    {ButtonB, "/user/hand/right/input/b/click"},
-    {GripPose, "/user/hand/right/input/grip/pose"},
-    {AimPose, "/user/hand/right/input/aim/pose"},
-
-    {m_HapticAction, "/user/hand/left/output/haptic"},
-    {m_HapticAction, "/user/hand/right/output/haptic"},
-  };
-  SuggestInteractionProfileBindings("/interaction_profiles/bytedance/pico_neo3_controller", "Pico Neo3", picoNeo3Controller, true);
+  // Every profile of the table: the built-in xr_hand_* bindings, palm pose and the action map paths.
+  for (const plXRInteractionProfileDesc& profile : m_Profiles)
+  {
+    SuggestProfile(profile, builtInActions);
+  }
 
   if (bViveTracker)
   {
@@ -637,6 +510,19 @@ XrResult plOpenXRInputDevice::CreateActions(XrSession session, XrSpace sceneSpac
     XR_LOG_ERROR(xrSuggestInteractionProfileBindings(m_pInstance, &suggestedBindings));
   }
 
+  if (bEyeGaze)
+  {
+    Bind eyeGaze[] = {
+      {m_EyeGazeAction, "/user/eyes_ext/input/gaze_ext/pose"},
+    };
+    if (SuggestInteractionProfileBindings("/interaction_profiles/ext/eye_gaze_interaction", "Eye Gaze", eyeGaze, true) != XR_SUCCESS)
+    {
+      // Nothing can be bound, so the action space below would never locate.
+      XR_LOG_ERROR(xrDestroyAction(m_EyeGazeAction));
+      m_EyeGazeAction = XR_NULL_HANDLE;
+    }
+  }
+
   XrActionSpaceCreateInfo spaceCreateInfo{XR_TYPE_ACTION_SPACE_CREATE_INFO};
   spaceCreateInfo.poseInActionSpace = m_pOpenXR->ConvertTransform(plTransform::MakeIdentity());
   for (plUInt32 uiSide : {0, 1})
@@ -647,6 +533,20 @@ XrResult plOpenXRInputDevice::CreateActions(XrSession session, XrSpace sceneSpac
 
     spaceCreateInfo.action = AimPose;
     XR_SUCCEED_OR_CLEANUP_LOG(xrCreateActionSpace(m_pSession, &spaceCreateInfo, &m_aimSpace[uiSide]), DestroyActions);
+
+    if (m_PalmPoseAction != XR_NULL_HANDLE)
+    {
+      spaceCreateInfo.action = m_PalmPoseAction;
+      XR_SUCCEED_OR_CLEANUP_LOG(xrCreateActionSpace(m_pSession, &spaceCreateInfo, &m_palmSpace[uiSide]), DestroyActions);
+    }
+  }
+
+  // Suggestions are frozen once AttachSessionActionSets runs; later map edits are reported, not applied.
+  m_sMapBindingSignature = BuildMapBindingSignature(plInputActionMap::GetPlayer(0).GetDescriptor());
+  m_bMapChangeLogged = false;
+  if (m_ActionMapEventId == 0)
+  {
+    m_ActionMapEventId = plInputActionMap::s_Events.AddEventHandler(plMakeDelegate(&plOpenXRInputDevice::OnActionMapEvent, this));
   }
 
   if (bViveTracker)
@@ -654,6 +554,16 @@ XrResult plOpenXRInputDevice::CreateActions(XrSession session, XrSpace sceneSpac
     spaceCreateInfo.subactionPath = m_SubActionPathVive[1];
     spaceCreateInfo.action = shoulderPoseAction;
     XR_SUCCEED_OR_CLEANUP_LOG(xrCreateActionSpace(m_pSession, &spaceCreateInfo, &shoulderSpace), DestroyActions);
+  }
+
+  if (m_EyeGazeAction != XR_NULL_HANDLE)
+  {
+    spaceCreateInfo.subactionPath = XR_NULL_PATH;
+    spaceCreateInfo.action = m_EyeGazeAction;
+    XR_SUCCEED_OR_CLEANUP_LOG(xrCreateActionSpace(m_pSession, &spaceCreateInfo, &m_EyeGazeSpace), DestroyActions);
+
+    // On Quest the runtime only reports gaze when the app holds the eye-tracking permission.
+    plLog::Info("OpenXR: Eye gaze is available as the EyeGaze device. Android needs the eye-tracking permission granted before the session starts.");
   }
 
   // Register input slots now that actions are created
@@ -685,11 +595,21 @@ void plOpenXRInputDevice::DestroyActions()
       XR_LOG_ERROR(xrDestroySpace(m_aimSpace[uiSide]));
       m_aimSpace[uiSide] = XR_NULL_HANDLE;
     }
+    if (m_palmSpace[uiSide])
+    {
+      XR_LOG_ERROR(xrDestroySpace(m_palmSpace[uiSide]));
+      m_palmSpace[uiSide] = XR_NULL_HANDLE;
+    }
   }
   if (shoulderSpace)
   {
     XR_LOG_ERROR(xrDestroySpace(shoulderSpace));
     shoulderSpace = XR_NULL_HANDLE;
+  }
+  if (m_EyeGazeSpace)
+  {
+    XR_LOG_ERROR(xrDestroySpace(m_EyeGazeSpace));
+    m_EyeGazeSpace = XR_NULL_HANDLE;
   }
 
   for (Action& action : m_BooleanActions)
@@ -710,11 +630,29 @@ void plOpenXRInputDevice::DestroyActions()
   }
   m_Vec2Actions.Clear();
 
+  // The palm pose action is one of m_PoseActions.
   for (Action& action : m_PoseActions)
   {
     XR_LOG_ERROR(xrDestroyAction(action.m_Action));
   }
   m_PoseActions.Clear();
+  m_PalmPoseAction = XR_NULL_HANDLE;
+
+  for (MapAction& action : m_MapActions)
+  {
+    if (action.m_Action)
+    {
+      XR_LOG_ERROR(xrDestroyAction(action.m_Action));
+    }
+  }
+  m_MapActions.Clear();
+
+  if (m_ActionMapEventId != 0)
+  {
+    plInputActionMap::s_Events.RemoveEventHandler(m_ActionMapEventId);
+    m_ActionMapEventId = 0;
+  }
+  m_sMapBindingSignature.Clear();
 
   // The vibration output action is tracked on its own as it has no input slots.
   if (m_HapticAction)
@@ -729,24 +667,16 @@ void plOpenXRInputDevice::DestroyActions()
     shoulderPoseAction = XR_NULL_HANDLE;
   }
 
+  if (m_EyeGazeAction)
+  {
+    XR_LOG_ERROR(xrDestroyAction(m_EyeGazeAction));
+    m_EyeGazeAction = XR_NULL_HANDLE;
+  }
+
   if (m_pActionSet)
   {
     XR_LOG_ERROR(xrDestroyActionSet(m_pActionSet));
     m_pActionSet = XR_NULL_HANDLE;
-  }
-
-  for (plUInt32 uiSide : {0, 1})
-  {
-    if (m_gripSpace[uiSide])
-    {
-      XR_LOG_ERROR(xrDestroySpace(m_gripSpace[uiSide]));
-      m_gripSpace[uiSide] = XR_NULL_HANDLE;
-    }
-    if (m_aimSpace[uiSide])
-    {
-      XR_LOG_ERROR(xrDestroySpace(m_aimSpace[uiSide]));
-      m_aimSpace[uiSide] = XR_NULL_HANDLE;
-    }
   }
 
   for (plUInt32 i = 0; i < s_iMaxDevices; i++)
@@ -759,17 +689,28 @@ void plOpenXRInputDevice::DestroyActions()
   for (plUInt32 uiSide : {0, 1})
   {
     m_DiscoveredFeatures[uiSide].Clear();
+    m_bBoundActionsCached[uiSide] = false;
   }
+
+  // The input thread is joined, so the working snapshot and the render model state are free to reset.
+  ResetRenderModels();
+  m_WorkingSnapshot.Clear();
+  {
+    PL_LOCK(m_SnapshotMutex);
+    m_PublishedSnapshot.Clear();
+  }
+  m_bInteractionProfileDirty = true;
 }
 
 XrPath plOpenXRInputDevice::CreatePath(const char* szPath)
 {
   XrInstance instance = m_pOpenXR->m_pInstance;
 
-  XrPath path;
+  XrPath path = XR_NULL_PATH;
   if (xrStringToPath(instance, szPath, &path) != XR_SUCCESS)
   {
     plLog::Error("OpenXR path conversion failure: {0}", szPath);
+    return XR_NULL_PATH;
   }
   return path;
 }
@@ -851,6 +792,587 @@ XrResult plOpenXRInputDevice::SuggestInteractionProfileBindings(
   return XR_SUCCESS;
 }
 
+void plOpenXRInputDevice::LoadInteractionProfiles()
+{
+  if (plXRInteractionProfiles::LoadFromFile(plXRInteractionProfiles::s_sDefaultFile, m_Profiles).Succeeded() && !m_Profiles.IsEmpty())
+    return;
+
+  plLog::Warning("OpenXR: '{}' is missing or has no profiles; the built-in interaction profiles are used.", plXRInteractionProfiles::s_sDefaultFile);
+  plXRInteractionProfiles::LoadFromDDL(s_szBuiltInProfiles, m_Profiles).IgnoreResult();
+}
+
+void plOpenXRInputDevice::CreateMapActions()
+{
+  m_MapActions.Clear();
+
+  const plInputActionMapDescriptor& desc = plInputActionMap::GetPlayer(0).GetDescriptor();
+  if (!desc.HasXRPaths())
+    return;
+
+  // Action names and localized names must both be unique within the action set.
+  plSet<plString> usedNames;
+  plSet<plString> usedLocalizedNames;
+  for (const BuiltInAction& builtIn : s_BuiltInActions)
+  {
+    usedNames.Insert(plString(builtIn.m_szName));
+    usedLocalizedNames.Insert(plString(builtIn.m_szName));
+  }
+  for (const char* szName : {"palm_pose", "left_shoulder_pose", "eye_gaze_pose"})
+  {
+    usedNames.Insert(plString(szName));
+    usedLocalizedNames.Insert(plString(szName));
+  }
+  usedLocalizedNames.Insert(plString("Left Shoulder Pose"));
+  usedLocalizedNames.Insert(plString("Eye Gaze Pose"));
+
+  plStringBuilder sSlot, sName, sUniqueName, sLocalized, sUniqueLocalized, sTmp;
+
+  for (const plInputContextDesc& ctx : desc.m_Contexts)
+  {
+    for (const plInputActionDesc& action : ctx.m_Actions)
+    {
+      plHybridArray<plInputXRPathDesc, 2> paths;
+      for (const plInputBindingDesc& binding : action.m_Bindings)
+      {
+        for (const plInputXRPathDesc& path : binding.m_XRPaths)
+        {
+          if (path.m_sPath.IsEmpty())
+            continue;
+
+          if (!path.m_sPath.StartsWith("/user/"))
+          {
+            plLog::Warning("OpenXR: '{}' of '{}/{}' is not an OpenXR input path; it is skipped.", path.m_sPath, ctx.m_sName, action.m_sName);
+            continue;
+          }
+
+          if (path.IsDpadPath())
+          {
+            if (!m_bUseDpadBinding)
+            {
+              plLog::Warning("OpenXR: '{}' of '{}/{}' needs XR.BindingModification and XR.DpadBinding (and a runtime with XR_EXT_dpad_binding); it is skipped.", path.m_sPath, ctx.m_sName, action.m_sName);
+              continue;
+            }
+
+            if (action.m_ValueType != plInputValueType::Button)
+            {
+              plLog::Warning("OpenXR: '{}' of '{}/{}' is a dpad direction, which only button actions can use; it is skipped.", path.m_sPath, ctx.m_sName, action.m_sName);
+              continue;
+            }
+          }
+
+          paths.PushBack(path);
+        }
+      }
+
+      if (paths.IsEmpty())
+        continue;
+
+      XrActionType type = XR_ACTION_TYPE_BOOLEAN_INPUT;
+      switch (action.m_ValueType)
+      {
+        case plInputValueType::Button:
+          type = XR_ACTION_TYPE_BOOLEAN_INPUT;
+          break;
+        case plInputValueType::Axis1D:
+          type = XR_ACTION_TYPE_FLOAT_INPUT;
+          break;
+        case plInputValueType::Axis2D:
+          type = XR_ACTION_TYPE_VECTOR2F_INPUT;
+          break;
+        default:
+          plLog::Warning("OpenXR: '{}/{}' is a 3D axis, which OpenXR has no action type for; its XR paths are skipped.", ctx.m_sName, action.m_sName);
+          continue;
+      }
+
+      plInputActionMapDescriptor::GetXRActionSlotName(ctx.m_sName, action.m_sName, sSlot);
+
+      SanitizeActionName(sSlot, sName);
+      sUniqueName = sName;
+      for (plUInt32 i = 2; usedNames.Contains(sUniqueName); ++i)
+      {
+        sTmp.SetFormat("_{}", i);
+        sUniqueName = sName;
+        if (sUniqueName.GetElementCount() + sTmp.GetElementCount() >= XR_MAX_ACTION_NAME_SIZE)
+          sUniqueName.Shrink(0, sUniqueName.GetElementCount() + sTmp.GetElementCount() - (XR_MAX_ACTION_NAME_SIZE - 1));
+        sUniqueName.Append(sTmp);
+      }
+
+      sLocalized.SetFormat("{} / {}", ctx.m_sName, action.m_sDisplayName.IsEmpty() ? action.m_sName : action.m_sDisplayName);
+      while (sLocalized.GetElementCount() >= XR_MAX_LOCALIZED_ACTION_NAME_SIZE - 8)
+        sLocalized.Shrink(0, 1);
+      sUniqueLocalized = sLocalized;
+      for (plUInt32 i = 2; usedLocalizedNames.Contains(sUniqueLocalized); ++i)
+      {
+        sUniqueLocalized.SetFormat("{} ({})", sLocalized, i);
+      }
+
+      XrActionCreateInfo actionInfo{XR_TYPE_ACTION_CREATE_INFO};
+      actionInfo.actionType = type;
+      plStringUtils::Copy(actionInfo.actionName, XR_MAX_ACTION_NAME_SIZE, sUniqueName);
+      plStringUtils::Copy(actionInfo.localizedActionName, XR_MAX_LOCALIZED_ACTION_NAME_SIZE, sUniqueLocalized);
+      actionInfo.countSubactionPaths = 0;
+      actionInfo.subactionPaths = nullptr;
+
+      XrAction xrAction = XR_NULL_HANDLE;
+      const XrResult res = xrCreateAction(m_pActionSet, &actionInfo, &xrAction);
+      if (XR_FAILED_RESULT(res))
+      {
+        plLog::Error("OpenXR: Creating the action '{}' for '{}/{}' failed ({}); its XR paths are skipped.", sUniqueName, ctx.m_sName, action.m_sName, res);
+        continue;
+      }
+
+      usedNames.Insert(plString(sUniqueName));
+      usedLocalizedNames.Insert(plString(sUniqueLocalized));
+
+      MapAction& mapAction = m_MapActions.ExpandAndGetRef();
+      mapAction.m_Action = xrAction;
+      mapAction.m_Type = type;
+      sTmp.SetFormat("{}/{}", ctx.m_sName, action.m_sName);
+      mapAction.m_sName = sTmp;
+      mapAction.m_sDisplayName = action.m_sDisplayName.IsEmpty() ? action.m_sName : action.m_sDisplayName;
+      mapAction.m_sSlot = sSlot;
+      mapAction.m_Paths = paths;
+
+      if (type != XR_ACTION_TYPE_BOOLEAN_INPUT)
+      {
+        sTmp.Set(sSlot, "_negx");
+        mapAction.m_sSlotNegX = sTmp;
+        sTmp.Set(sSlot, "_posx");
+        mapAction.m_sSlotPosX = sTmp;
+      }
+
+      if (type == XR_ACTION_TYPE_VECTOR2F_INPUT)
+      {
+        sTmp.Set(sSlot, "_negy");
+        mapAction.m_sSlotNegY = sTmp;
+        sTmp.Set(sSlot, "_posy");
+        mapAction.m_sSlotPosY = sTmp;
+      }
+    }
+  }
+
+  plLog::Info("OpenXR: {} input action map action(s) have XR paths.", m_MapActions.GetCount());
+}
+
+XrResult plOpenXRInputDevice::TrySuggestBindings(XrPath profilePath, plArrayPtr<const SuggestedBinding> bindings)
+{
+  plDynamicArray<XrActionSuggestedBinding> xrBindings;
+  xrBindings.Reserve(bindings.GetCount());
+
+  // One dpad modification per split stick or trackpad, shared by its four directions and the centre.
+  plHybridArray<const XrBindingModificationBaseHeaderKHR*, 8> modifications;
+  plHybridArray<XrPath, 8> dpadParents;
+
+  for (const SuggestedBinding& binding : bindings)
+  {
+    xrBindings.PushBack(binding.m_Binding);
+
+    if (binding.m_bDpad && !dpadParents.Contains(binding.m_Dpad.binding))
+    {
+      dpadParents.PushBack(binding.m_Dpad.binding);
+      modifications.PushBack(reinterpret_cast<const XrBindingModificationBaseHeaderKHR*>(&binding.m_Dpad));
+    }
+  }
+
+  XrInteractionProfileSuggestedBinding profileBindings{XR_TYPE_INTERACTION_PROFILE_SUGGESTED_BINDING};
+  profileBindings.interactionProfile = profilePath;
+  profileBindings.suggestedBindings = xrBindings.GetData();
+  profileBindings.countSuggestedBindings = xrBindings.GetCount();
+
+  XrBindingModificationsKHR bindingModifications{XR_TYPE_BINDING_MODIFICATIONS_KHR};
+  if (!modifications.IsEmpty())
+  {
+    bindingModifications.bindingModificationCount = modifications.GetCount();
+    bindingModifications.bindingModifications = modifications.GetData();
+    profileBindings.next = &bindingModifications;
+  }
+
+  return xrSuggestInteractionProfileBindings(m_pInstance, &profileBindings);
+}
+
+XrResult plOpenXRInputDevice::SuggestProfile(const plXRInteractionProfileDesc& profile, const plHashTable<plString, XrAction>& builtInActions)
+{
+  if (!profile.m_sExtension.IsEmpty() && !m_pOpenXR->IsExtensionEnabled(profile.m_sExtension))
+  {
+    plLog::Debug("OpenXR: Interaction profile '{}' needs {}, which is not enabled; its bindings are skipped.", profile.m_sPath, profile.m_sExtension);
+    return XR_ERROR_EXTENSION_NOT_PRESENT;
+  }
+
+  const XrPath profilePath = CreatePath(profile.m_sPath);
+  if (profilePath == XR_NULL_PATH)
+    return XR_ERROR_PATH_INVALID;
+
+  // Built-in bindings must all be accepted. Palm pose and action map bindings are kept where the runtime accepts them.
+  plDynamicArray<SuggestedBinding> required;
+  plDynamicArray<SuggestedBinding> optional;
+  plStringBuilder sPath;
+
+  for (const plXRInteractionProfileDesc::Component& component : profile.m_Components)
+  {
+    for (const plString& sAction : component.m_Actions)
+    {
+      XrAction action = XR_NULL_HANDLE;
+      if (!builtInActions.TryGetValue(sAction, action) || action == XR_NULL_HANDLE)
+      {
+        plLog::Warning("OpenXR: Interaction profile '{}' binds '{}' to the unknown action '{}'.", profile.m_sPath, component.m_sPath, sAction);
+        continue;
+      }
+
+      const XrPath path = CreatePath(component.m_sPath);
+      if (path == XR_NULL_PATH)
+        continue;
+
+      SuggestedBinding& binding = required.ExpandAndGetRef();
+      binding.m_Binding = {action, path};
+      binding.m_sPath = component.m_sPath;
+      binding.m_sOwner = sAction;
+    }
+
+    if (m_PalmPoseAction != XR_NULL_HANDLE && component.m_Type == plXRComponentType::Pose && component.m_sPath.EndsWith("/input/grip/pose"))
+    {
+      sPath = component.m_sPath;
+      sPath.ReplaceLast("/input/grip/pose", "/input/palm_ext/pose");
+
+      const XrPath path = CreatePath(sPath);
+      if (path != XR_NULL_PATH)
+      {
+        SuggestedBinding& binding = optional.ExpandAndGetRef();
+        binding.m_Binding = {m_PalmPoseAction, path};
+        binding.m_sPath = sPath;
+        binding.m_sOwner = "palm_pose";
+      }
+    }
+  }
+
+  for (const MapAction& mapAction : m_MapActions)
+  {
+    for (const plInputXRPathDesc& mapPath : mapAction.m_Paths)
+    {
+      // A path for every profile only goes to the profiles that list it; a path for a named profile is always tried.
+      if (mapPath.m_sProfile.IsEmpty())
+      {
+        if (!plXRInteractionProfiles::ProfileHasPath(profile, mapPath.m_sPath))
+          continue;
+      }
+      else if (!profile.MatchesName(mapPath.m_sProfile))
+      {
+        continue;
+      }
+
+      const XrPath path = CreatePath(mapPath.m_sPath);
+      if (path == XR_NULL_PATH)
+        continue;
+
+      SuggestedBinding& binding = optional.ExpandAndGetRef();
+      binding.m_Binding = {mapAction.m_Action, path};
+      binding.m_sPath = mapPath.m_sPath;
+      binding.m_sOwner = mapAction.m_sName;
+
+      if (mapPath.IsDpadPath())
+      {
+        sPath = plXRInteractionProfiles::GetDpadParentPath(mapPath.m_sPath);
+
+        binding.m_bDpad = true;
+        binding.m_Dpad = {XR_TYPE_INTERACTION_PROFILE_DPAD_BINDING_EXT};
+        binding.m_Dpad.binding = CreatePath(sPath);
+        binding.m_Dpad.actionSet = m_pActionSet;
+        binding.m_Dpad.forceThreshold = 0.5f;
+        binding.m_Dpad.forceThresholdReleased = 0.4f;
+        binding.m_Dpad.centerRegion = plMath::Clamp(mapPath.m_fDpadCenterRegion, 0.01f, 0.99f);
+        binding.m_Dpad.wedgeAngle = plMath::Clamp(mapPath.m_DpadWedgeAngle.GetRadian(), 0.01f, plMath::Pi<float>() - 0.01f);
+        binding.m_Dpad.isSticky = mapPath.m_bDpadSticky ? XR_TRUE : XR_FALSE;
+        binding.m_Dpad.onHaptic = nullptr;
+        binding.m_Dpad.offHaptic = nullptr;
+
+        if (binding.m_Dpad.binding == XR_NULL_PATH)
+        {
+          optional.PopBack();
+          continue;
+        }
+      }
+    }
+  }
+
+  plDynamicArray<SuggestedBinding> accepted = required;
+  accepted.PushBackRange(optional);
+
+  XrResult res = TrySuggestBindings(profilePath, accepted);
+  if (XR_FAILED_RESULT(res) && !optional.IsEmpty())
+  {
+    // One rejected path fails the whole call, so find the ones the runtime does not accept. Each successful call
+    // replaces the previous suggestion for the profile.
+    accepted = required;
+    res = TrySuggestBindings(profilePath, accepted);
+
+    if (!XR_FAILED_RESULT(res))
+    {
+      bool bLastFailed = false;
+      for (const SuggestedBinding& candidate : optional)
+      {
+        accepted.PushBack(candidate);
+        const XrResult candidateRes = TrySuggestBindings(profilePath, accepted);
+        bLastFailed = XR_FAILED_RESULT(candidateRes);
+
+        if (bLastFailed)
+        {
+          accepted.PopBack();
+
+          if (candidate.m_sOwner == "palm_pose")
+            plLog::Info("OpenXR: '{}' has no palm pose ({}).", profile.m_sDisplayName, candidateRes);
+          else
+            plLog::Warning("OpenXR: '{}' rejects '{}' ({}); that binding of '{}' is skipped.", profile.m_sDisplayName, candidate.m_sPath, candidateRes, candidate.m_sOwner);
+        }
+      }
+
+      if (bLastFailed)
+      {
+        res = TrySuggestBindings(profilePath, accepted);
+      }
+    }
+  }
+
+  if (XR_FAILED_RESULT(res))
+  {
+    plLog::Error("OpenXR: Suggesting bindings for interaction profile '{0}' failed with: {1}", profile.m_sPath, res);
+    return res;
+  }
+
+  m_InteractionProfileToNiceName[profilePath] = profile.m_sDisplayName;
+  return XR_SUCCESS;
+}
+
+plString plOpenXRInputDevice::BuildMapBindingSignature(const plInputActionMapDescriptor& desc)
+{
+  plStringBuilder sSignature;
+
+  for (const plInputContextDesc& ctx : desc.m_Contexts)
+  {
+    for (const plInputActionDesc& action : ctx.m_Actions)
+    {
+      for (const plInputBindingDesc& binding : action.m_Bindings)
+      {
+        for (const plInputXRPathDesc& path : binding.m_XRPaths)
+        {
+          sSignature.AppendFormat("{}|{}|{}|{}|{}|{}|{}|{};", ctx.m_sName, action.m_sName, static_cast<plUInt32>(action.m_ValueType.GetValue()), path.m_sProfile, path.m_sPath,
+            path.m_fDpadCenterRegion, path.m_DpadWedgeAngle.GetDegree(), path.m_bDpadSticky);
+        }
+      }
+    }
+  }
+
+  return sSignature;
+}
+
+void plOpenXRInputDevice::OnActionMapEvent(const plInputActionMapEvent& e)
+{
+  if (e.m_Type != plInputActionMapEvent::Type::MapChanged || e.m_uiPlayer != 0 || m_bMapChangeLogged || m_pActionSet == XR_NULL_HANDLE)
+    return;
+
+  if (BuildMapBindingSignature(plInputActionMap::GetPlayer(0).GetDescriptor()) == m_sMapBindingSignature)
+    return;
+
+  m_bMapChangeLogged = true;
+  plLog::Warning("XR bindings apply at the next session");
+}
+
+void plOpenXRInputDevice::UpdateMapActions(InputSnapshot& snapshot)
+{
+  if (m_MapActions.IsEmpty())
+    return;
+
+  // No subaction path: the runtime combines every source bound to the action.
+  XrActionStateGetInfo getInfo{XR_TYPE_ACTION_STATE_GET_INFO};
+  getInfo.subactionPath = XR_NULL_PATH;
+
+  for (const MapAction& action : m_MapActions)
+  {
+    getInfo.action = action.m_Action;
+
+    switch (action.m_Type)
+    {
+      case XR_ACTION_TYPE_BOOLEAN_INPUT:
+      {
+        XrActionStateBoolean state{XR_TYPE_ACTION_STATE_BOOLEAN};
+        if (xrGetActionStateBoolean(m_pSession, &getInfo, &state) == XR_SUCCESS)
+        {
+          snapshot.m_InputSlotValues[action.m_sSlot] = state.currentState ? 1.0f : 0.0f;
+        }
+        break;
+      }
+
+      case XR_ACTION_TYPE_FLOAT_INPUT:
+      {
+        XrActionStateFloat state{XR_TYPE_ACTION_STATE_FLOAT};
+        if (xrGetActionStateFloat(m_pSession, &getInfo, &state) == XR_SUCCESS)
+        {
+          const float x = state.currentState;
+          snapshot.m_InputSlotValues[action.m_sSlot] = plMath::Max(x, 0.0f);
+          snapshot.m_InputSlotValues[action.m_sSlotNegX] = x < 0 ? -x : 0.0f;
+          snapshot.m_InputSlotValues[action.m_sSlotPosX] = x > 0 ? x : 0.0f;
+        }
+        break;
+      }
+
+      case XR_ACTION_TYPE_VECTOR2F_INPUT:
+      {
+        XrActionStateVector2f state{XR_TYPE_ACTION_STATE_VECTOR2F};
+        if (xrGetActionStateVector2f(m_pSession, &getInfo, &state) == XR_SUCCESS)
+        {
+          const float x = state.currentState.x;
+          const float y = state.currentState.y;
+          snapshot.m_InputSlotValues[action.m_sSlot] = plMath::Min(plMath::Sqrt(x * x + y * y), 1.0f);
+          snapshot.m_InputSlotValues[action.m_sSlotNegX] = x < 0 ? -x : 0.0f;
+          snapshot.m_InputSlotValues[action.m_sSlotPosX] = x > 0 ? x : 0.0f;
+          snapshot.m_InputSlotValues[action.m_sSlotNegY] = y < 0 ? -y : 0.0f;
+          snapshot.m_InputSlotValues[action.m_sSlotPosY] = y > 0 ? y : 0.0f;
+        }
+        break;
+      }
+
+      default:
+        break;
+    }
+  }
+}
+
+void plOpenXRInputDevice::UpdatePalmPose(plUInt32 uiSide, InputSnapshot& snapshot, XrSpace baseSpace, XrTime time)
+{
+  if (m_palmSpace[uiSide] == XR_NULL_HANDLE)
+    return;
+
+  const plUInt32 uiControllerId = uiSide == 0 ? m_iLeftControllerDeviceID : m_iRightControllerDeviceID;
+  plXRDeviceState& deviceState = snapshot.m_DeviceState[uiControllerId];
+
+  constexpr XrSpaceLocationFlags validFlags = XR_SPACE_LOCATION_POSITION_VALID_BIT | XR_SPACE_LOCATION_ORIENTATION_VALID_BIT;
+  XrSpaceLocation location{XR_TYPE_SPACE_LOCATION};
+  const XrResult res = xrLocateSpace(m_palmSpace[uiSide], baseSpace, time, &location);
+  if (res != XR_SUCCESS)
+  {
+    ReportLocateFailure(uiSide, "xrLocateSpace(palm)", res, baseSpace, time);
+    deviceState.m_bPalmPoseIsValid = false;
+    return;
+  }
+
+  if ((location.locationFlags & validFlags) != validFlags)
+  {
+    deviceState.m_bPalmPoseIsValid = false;
+    return;
+  }
+
+  deviceState.m_vPalmPosition = plOpenXR::ConvertPosition(location.pose.position);
+  deviceState.m_qPalmRotation = plOpenXR::ConvertOrientation(location.pose.orientation);
+  deviceState.m_bPalmPoseIsValid = true;
+  m_DiscoveredFeatures[uiSide].Add(plXRDeviceFeatures::PalmPose);
+}
+
+plString plOpenXRInputDevice::GetLocalizedSourceName(XrAction action, plStringView sHandPrefix, XrInputSourceLocalizedNameFlags flags) const
+{
+  if (action == XR_NULL_HANDLE)
+    return {};
+
+  XrBoundSourcesForActionEnumerateInfo enumerateInfo{XR_TYPE_BOUND_SOURCES_FOR_ACTION_ENUMERATE_INFO};
+  enumerateInfo.action = action;
+
+  plUInt32 uiSourceCount = 0;
+  if (XR_FAILED_RESULT(xrEnumerateBoundSourcesForAction(m_pSession, &enumerateInfo, 0, &uiSourceCount, nullptr)) || uiSourceCount == 0)
+    return {};
+
+  plHybridArray<XrPath, 4> sources;
+  sources.SetCount(uiSourceCount);
+  if (XR_FAILED_RESULT(xrEnumerateBoundSourcesForAction(m_pSession, &enumerateInfo, uiSourceCount, &uiSourceCount, sources.GetData())))
+    return {};
+  sources.SetCount(uiSourceCount);
+
+  for (XrPath source : sources)
+  {
+    if (!sHandPrefix.IsEmpty())
+    {
+      char szPath[XR_MAX_PATH_LENGTH] = {};
+      plUInt32 uiWritten = 0;
+      if (xrPathToString(m_pInstance, source, XR_MAX_PATH_LENGTH, &uiWritten, szPath) != XR_SUCCESS || !plStringView(szPath).StartsWith(sHandPrefix))
+        continue;
+    }
+
+    XrInputSourceLocalizedNameGetInfo nameInfo{XR_TYPE_INPUT_SOURCE_LOCALIZED_NAME_GET_INFO};
+    nameInfo.sourcePath = source;
+    nameInfo.whichComponents = flags;
+
+    plUInt32 uiSize = 0;
+    if (XR_FAILED_RESULT(xrGetInputSourceLocalizedName(m_pSession, &nameInfo, 0, &uiSize, nullptr)) || uiSize == 0)
+      continue;
+
+    plHybridArray<char, 128> buffer;
+    buffer.SetCount(uiSize);
+    if (XR_FAILED_RESULT(xrGetInputSourceLocalizedName(m_pSession, &nameInfo, uiSize, &uiSize, buffer.GetData())))
+      continue;
+
+    buffer[buffer.GetCount() - 1] = '\0';
+    return plString(buffer.GetData());
+  }
+
+  return {};
+}
+
+void plOpenXRInputDevice::UpdateGlyphs()
+{
+  PL_PROFILE_SCOPE("UpdateXRGlyphs");
+
+  plStringBuilder sLabel;
+  auto SetLabel = [&](const plString& sSlot, plStringView sName, plStringView sSuffix)
+  {
+    if (sSlot.IsEmpty() || sName.IsEmpty())
+      return;
+
+    // The sprite of a project glyph stays; only the label follows the connected controller.
+    sLabel.Set(sName, sSuffix);
+    plInputGlyphs::SetGlyph(sSlot, sLabel, plInputGlyphs::GetSprite(sSlot));
+  };
+
+  plUInt32 uiNames = 0;
+  plString sName;
+
+  for (plUInt32 uiSide : {0, 1})
+  {
+    for (const Action& action : m_BooleanActions)
+    {
+      sName = GetLocalizedSourceName(action.m_Action, s_sHandPrefix[uiSide], XR_INPUT_SOURCE_LOCALIZED_NAME_COMPONENT_BIT);
+      SetLabel(action.m_sKey[uiSide], sName, "");
+      uiNames += sName.IsEmpty() ? 0 : 1;
+    }
+
+    for (const Action& action : m_FloatActions)
+    {
+      sName = GetLocalizedSourceName(action.m_Action, s_sHandPrefix[uiSide], XR_INPUT_SOURCE_LOCALIZED_NAME_COMPONENT_BIT);
+      SetLabel(action.m_sKey[uiSide], sName, "");
+      uiNames += sName.IsEmpty() ? 0 : 1;
+    }
+
+    for (const Vec2Action& action : m_Vec2Actions)
+    {
+      sName = GetLocalizedSourceName(action.m_Action, s_sHandPrefix[uiSide], XR_INPUT_SOURCE_LOCALIZED_NAME_COMPONENT_BIT);
+      SetLabel(action.m_sKey_negx[uiSide], sName, " Left");
+      SetLabel(action.m_sKey_posx[uiSide], sName, " Right");
+      SetLabel(action.m_sKey_negy[uiSide], sName, " Down");
+      SetLabel(action.m_sKey_posy[uiSide], sName, " Up");
+      uiNames += sName.IsEmpty() ? 0 : 1;
+    }
+  }
+
+  // Action map actions are not tied to a hand, so their names say which one.
+  for (const MapAction& action : m_MapActions)
+  {
+    sName = GetLocalizedSourceName(action.m_Action, {}, XR_INPUT_SOURCE_LOCALIZED_NAME_USER_PATH_BIT | XR_INPUT_SOURCE_LOCALIZED_NAME_COMPONENT_BIT);
+    SetLabel(action.m_sSlot, sName, "");
+    SetLabel(action.m_sSlotNegX, sName, " Left");
+    SetLabel(action.m_sSlotPosX, sName, " Right");
+    SetLabel(action.m_sSlotNegY, sName, " Down");
+    SetLabel(action.m_sSlotPosY, sName, " Up");
+    uiNames += sName.IsEmpty() ? 0 : 1;
+  }
+
+  plLog::Debug("OpenXR: Read {} input names for the button prompts.", uiNames);
+}
+
 XrResult plOpenXRInputDevice::AttachSessionActionSets(XrSession session)
 {
   m_pSession = session;
@@ -869,52 +1391,44 @@ XrResult plOpenXRInputDevice::AttachSessionActionSets(XrSession session)
   return XR_SUCCESS;
 }
 
-XrResult plOpenXRInputDevice::UpdateCurrentInteractionProfile()
+void plOpenXRInputDevice::RequestInteractionProfileUpdate()
 {
-  // This function is triggered by the XR_TYPE_EVENT_DATA_INTERACTION_PROFILE_CHANGED event.
-  // Unfortunately it does not seem to provide any info in regards to what top level path is affected
-  // so we check both controllers again.
-  auto GetActiveControllerProfile = [this](plUInt32 uiSide) -> XrPath
-  {
-    XrInteractionProfileState state{XR_TYPE_INTERACTION_PROFILE_STATE};
-    XrResult res = xrGetCurrentInteractionProfile(m_pSession, m_SubActionPath[uiSide], &state);
-    if (res == XR_SUCCESS)
-    {
-#if PL_ENABLED(PL_COMPILE_FOR_DEBUG)
-      if (state.interactionProfile != XR_NULL_PATH && !m_InteractionProfileToNiceName.Contains(state.interactionProfile))
-      {
-        char buffer[256];
-        plUInt32 temp;
-        xrPathToString(m_pInstance, state.interactionProfile, 256, &temp, buffer);
-        PL_REPORT_FAILURE("Unknown interaction profile was selected by the OpenXR runtime: '{}'", buffer);
-      }
-#endif
-      return state.interactionProfile;
-    }
-    return XR_NULL_PATH;
-  };
+  m_bInteractionProfileDirty = true;
+}
 
+void plOpenXRInputDevice::UpdateInteractionProfiles(InputSnapshot& snapshot)
+{
+  // XR_TYPE_EVENT_DATA_INTERACTION_PROFILE_CHANGED does not say which top-level path changed, so both hands are
+  // queried again.
   for (plUInt32 uiSide : {0, 1})
   {
-    const plUInt32 uiControllerId = uiSide == 0 ? 1 : 2;
-    XrPath path = GetActiveControllerProfile(uiSide);
-    plString newProfile = m_InteractionProfileToNiceName[path];
+    const plUInt32 uiControllerId = uiSide == 0 ? m_iLeftControllerDeviceID : m_iRightControllerDeviceID;
 
-    // Only invalidate cache if the profile actually changed
-    if (m_sActiveProfile[uiControllerId] && m_sActiveProfile[uiControllerId] != newProfile)
+    XrInteractionProfileState state{XR_TYPE_INTERACTION_PROFILE_STATE};
+    if (xrGetCurrentInteractionProfile(m_pSession, m_SubActionPath[uiSide], &state) != XR_SUCCESS)
+      continue;
+
+    plString sNewProfile;
+    if (state.interactionProfile != XR_NULL_PATH && !m_InteractionProfileToNiceName.TryGetValue(state.interactionProfile, sNewProfile))
     {
-      plLog::Info("OpenXR: Controller {} profile changed from '{}' to '{}'",
-        uiSide == 0 ? "Left" : "Right",
-        m_sActiveProfile[uiControllerId],
-        newProfile);
-      m_sActiveProfile[uiControllerId] = newProfile;
-      m_bBoundActionsCached[uiSide] = false;
+      char szBuffer[XR_MAX_PATH_LENGTH] = {};
+      plUInt32 uiWritten = 0;
+      xrPathToString(m_pInstance, state.interactionProfile, XR_MAX_PATH_LENGTH, &uiWritten, szBuffer);
+      plLog::Warning("OpenXR: The runtime selected interaction profile '{}', which has no suggested bindings.", szBuffer);
+      sNewProfile = szBuffer;
     }
+
+    if (snapshot.m_sActiveProfile[uiControllerId] != sNewProfile)
+    {
+      plLog::Info("OpenXR: {} controller profile is now '{}'.", uiSide == 0 ? "Left" : "Right", sNewProfile);
+      snapshot.m_sActiveProfile[uiControllerId] = sNewProfile;
+      m_bBoundActionsCached[uiSide] = false;
+      m_bGlyphsDirty |= !sNewProfile.IsEmpty();
+    }
+
+    // A new interaction profile usually means a different controller, so the render model key is read again.
+    m_RenderModelState[uiSide].m_bQueryKey = true;
   }
-
-  UpdateActions();
-
-  return XR_SUCCESS;
 }
 
 void plOpenXRInputDevice::InitializeDevice()
@@ -948,6 +1462,31 @@ void plOpenXRInputDevice::RegisterInputSlots()
       RegisterInputSlot(action.m_sKey_posy[uiSide], action.m_sKey_posy[uiSide], plInputSlotFlags::IsAnalogStick);
     }
   }
+
+  // The generated 'xr_action_<context>_<action>' slots of input action map actions with XR paths.
+  for (const MapAction& action : m_MapActions)
+  {
+    switch (action.m_Type)
+    {
+      case XR_ACTION_TYPE_BOOLEAN_INPUT:
+        RegisterInputSlot(action.m_sSlot, action.m_sDisplayName, plInputSlotFlags::IsButton);
+        break;
+      case XR_ACTION_TYPE_FLOAT_INPUT:
+        RegisterInputSlot(action.m_sSlot, action.m_sDisplayName, plInputSlotFlags::IsAnalogTrigger);
+        RegisterInputSlot(action.m_sSlotNegX, action.m_sDisplayName, plInputSlotFlags::IsAnalogStick);
+        RegisterInputSlot(action.m_sSlotPosX, action.m_sDisplayName, plInputSlotFlags::IsAnalogStick);
+        break;
+      case XR_ACTION_TYPE_VECTOR2F_INPUT:
+        RegisterInputSlot(action.m_sSlot, action.m_sDisplayName, plInputSlotFlags::IsAnalogStick);
+        RegisterInputSlot(action.m_sSlotNegX, action.m_sDisplayName, plInputSlotFlags::IsAnalogStick);
+        RegisterInputSlot(action.m_sSlotPosX, action.m_sDisplayName, plInputSlotFlags::IsAnalogStick);
+        RegisterInputSlot(action.m_sSlotNegY, action.m_sDisplayName, plInputSlotFlags::IsAnalogStick);
+        RegisterInputSlot(action.m_sSlotPosY, action.m_sDisplayName, plInputSlotFlags::IsAnalogStick);
+        break;
+      default:
+        break;
+    }
+  }
 }
 
 void plOpenXRInputDevice::UpdateInputSlotValues()
@@ -974,21 +1513,93 @@ void plOpenXRInputDevice::CopySnapshotToMainThread()
 {
   PL_PROFILE_SCOPE("CopyInputSnapshot");
 
-  // Read from the current readable snapshot (lock-free read of atomic index)
-  const plInt32 readIdx = m_iReadableSnapshot;
-  const InputSnapshot& snapshot = m_InputSnapshots[readIdx];
+  PL_LOCK(m_SnapshotMutex);
+  const InputSnapshot& snapshot = m_PublishedSnapshot;
 
-  // Copy device states
-  for (plUInt32 i = 0; i < s_iMaxDevices; ++i)
+  // Slot 0 is the HMD, which plOpenXR::UpdatePoses writes directly. The connected flag stays main-thread state.
+  for (plUInt32 i = 1; i < s_iMaxDevices; ++i)
   {
+    const bool bConnected = m_DeviceState[i].m_bDeviceIsConnected;
     m_DeviceState[i] = snapshot.m_DeviceState[i];
+    m_DeviceState[i].m_bDeviceIsConnected = bConnected;
     m_SupportedFeatures[i] = snapshot.m_SupportedFeatures[i];
+    m_sActiveProfile[i] = snapshot.m_sActiveProfile[i];
   }
 
-  // Copy input slot values
   for (auto it = snapshot.m_InputSlotValues.GetIterator(); it.IsValid(); ++it)
   {
     m_InputSlotValues[it.Key()] = it.Value();
+  }
+
+  for (plUInt32 uiSide : {0, 1})
+  {
+    if (m_sRenderModelNodePoseKey[uiSide] != snapshot.m_sRenderModelNodePoseKey[uiSide])
+    {
+      m_sRenderModelNodePoseKey[uiSide] = snapshot.m_sRenderModelNodePoseKey[uiSide];
+    }
+    m_RenderModelNodePoses[uiSide] = snapshot.m_RenderModelNodePoses[uiSide];
+  }
+
+  // A model the input thread loaded (or dropped) since the last frame. Moved, not copied: the bytes can be megabytes.
+  {
+    PL_LOCK(m_RenderModelMutex);
+    for (plUInt32 uiSide : {0, 1})
+    {
+      if (m_PendingRenderModel[uiSide].m_bPending)
+      {
+        m_RenderModel[uiSide] = std::move(m_PendingRenderModel[uiSide].m_Model);
+        m_PendingRenderModel[uiSide].m_Model = RenderModel();
+        m_PendingRenderModel[uiSide].m_bPending = false;
+      }
+    }
+  }
+}
+
+void plOpenXRInputDevice::PublishSnapshot()
+{
+  PL_PROFILE_SCOPE("PublishInputSnapshot");
+
+  PL_LOCK(m_SnapshotMutex);
+
+  for (plUInt32 i = 1; i < s_iMaxDevices; ++i)
+  {
+    m_PublishedSnapshot.m_DeviceState[i] = m_WorkingSnapshot.m_DeviceState[i];
+    m_PublishedSnapshot.m_SupportedFeatures[i] = m_WorkingSnapshot.m_SupportedFeatures[i];
+    if (m_PublishedSnapshot.m_sActiveProfile[i] != m_WorkingSnapshot.m_sActiveProfile[i])
+    {
+      m_PublishedSnapshot.m_sActiveProfile[i] = m_WorkingSnapshot.m_sActiveProfile[i];
+    }
+  }
+
+  for (auto it = m_WorkingSnapshot.m_InputSlotValues.GetIterator(); it.IsValid(); ++it)
+  {
+    m_PublishedSnapshot.m_InputSlotValues[it.Key()] = it.Value();
+  }
+
+  for (plUInt32 uiSide : {0, 1})
+  {
+    if (m_PublishedSnapshot.m_sRenderModelNodePoseKey[uiSide] != m_WorkingSnapshot.m_sRenderModelNodePoseKey[uiSide])
+    {
+      m_PublishedSnapshot.m_sRenderModelNodePoseKey[uiSide] = m_WorkingSnapshot.m_sRenderModelNodePoseKey[uiSide];
+    }
+    m_PublishedSnapshot.m_RenderModelNodePoses[uiSide] = m_WorkingSnapshot.m_RenderModelNodePoses[uiSide];
+  }
+}
+
+void plOpenXRInputDevice::InputSnapshot::Clear()
+{
+  for (plUInt32 i = 0; i < s_iMaxDevices; ++i)
+  {
+    m_DeviceState[i] = plXRDeviceState();
+    m_SupportedFeatures[i].Clear();
+    m_sActiveProfile[i].Clear();
+  }
+  m_InputSlotValues.Clear();
+
+  for (plUInt32 uiSide : {0, 1})
+  {
+    m_sRenderModelNodePoseKey[uiSide].Clear();
+    m_RenderModelNodePoses[uiSide].Clear();
   }
 }
 
@@ -1034,15 +1645,350 @@ void plOpenXRInputDevice::UpdateLeftShoulderTracking(InputSnapshot& snapshot, Xr
     deviceState.m_bAimPoseIsValid = false;
   }
 }
+
+void plOpenXRInputDevice::UpdateEyeGaze(InputSnapshot& snapshot, XrSpace baseSpace, XrTime time)
+{
+  if (m_EyeGazeAction == XR_NULL_HANDLE || m_EyeGazeSpace == XR_NULL_HANDLE || baseSpace == XR_NULL_HANDLE)
+    return;
+
+  plXRDeviceState& deviceState = snapshot.m_DeviceState[m_iEyeGazeDeviceId];
+  plBitflags<plXRDeviceFeatures>& supportedFeatures = snapshot.m_SupportedFeatures[m_iEyeGazeDeviceId];
+
+  XrActionStateGetInfo getInfo{XR_TYPE_ACTION_STATE_GET_INFO};
+  getInfo.action = m_EyeGazeAction;
+  getInfo.subactionPath = XR_NULL_PATH;
+
+  XrActionStatePose poseState{XR_TYPE_ACTION_STATE_POSE};
+  if (xrGetActionStatePose(m_pSession, &getInfo, &poseState) != XR_SUCCESS || !poseState.isActive)
+  {
+    // UpdateControllerState reports the device as disconnected once AimPose is gone.
+    supportedFeatures.Clear();
+    deviceState.m_bGripPoseIsValid = false;
+    deviceState.m_bAimPoseIsValid = false;
+    deviceState.m_bAimPoseIsTracked = false;
+    return;
+  }
+
+  // The gaze ray is the aim pose. It is mirrored into the grip pose so tracking components that follow the grip work too.
+  supportedFeatures = plXRDeviceFeatures::GripPose | plXRDeviceFeatures::AimPose;
+  if (snapshot.m_sActiveProfile[m_iEyeGazeDeviceId].IsEmpty())
+  {
+    snapshot.m_sActiveProfile[m_iEyeGazeDeviceId] = "Eye Gaze";
+  }
+
+  XrEyeGazeSampleTimeEXT sampleTime{XR_TYPE_EYE_GAZE_SAMPLE_TIME_EXT};
+  XrSpaceLocation location{XR_TYPE_SPACE_LOCATION};
+  location.next = &sampleTime;
+
+  constexpr XrSpaceLocationFlags validFlags = XR_SPACE_LOCATION_POSITION_VALID_BIT | XR_SPACE_LOCATION_ORIENTATION_VALID_BIT;
+  constexpr XrSpaceLocationFlags trackedFlags = XR_SPACE_LOCATION_POSITION_TRACKED_BIT | XR_SPACE_LOCATION_ORIENTATION_TRACKED_BIT;
+  if (xrLocateSpace(m_EyeGazeSpace, baseSpace, time, &location) == XR_SUCCESS && (location.locationFlags & validFlags) == validFlags)
+  {
+    deviceState.m_vAimPosition = plOpenXR::ConvertPosition(location.pose.position);
+    deviceState.m_qAimRotation = plOpenXR::ConvertOrientation(location.pose.orientation);
+    deviceState.m_bAimPoseIsValid = true;
+    // Valid but untracked is the last known gaze, e.g. while the eyes are closed.
+    deviceState.m_bAimPoseIsTracked = (location.locationFlags & trackedFlags) == trackedFlags;
+    deviceState.m_vGripPosition = deviceState.m_vAimPosition;
+    deviceState.m_qGripRotation = deviceState.m_qAimRotation;
+    deviceState.m_bGripPoseIsValid = true;
+  }
+  else
+  {
+    deviceState.m_bGripPoseIsValid = false;
+    deviceState.m_bAimPoseIsValid = false;
+    deviceState.m_bAimPoseIsTracked = false;
+  }
+}
+
+void plOpenXRInputDevice::RenderModelState::Reset()
+{
+  m_KeyMSFT = XR_NULL_CONTROLLER_MODEL_KEY_MSFT;
+  m_KeyFB = XR_NULL_RENDER_MODEL_KEY_FB;
+  m_sKey.Clear();
+  m_NodeNames.Clear();
+  m_NodeStates.Clear();
+  m_bQueryKey = true;
+  m_NextRetry = plTime::MakeZero();
+}
+
+void plOpenXRInputDevice::ResetRenderModels()
+{
+  // Main thread, with the input thread stopped (or not started yet).
+  m_bRenderModelPathsEnumeratedFB = false;
+  for (plUInt32 uiSide : {0, 1})
+  {
+    m_RenderModelState[uiSide].Reset();
+    m_RenderModel[uiSide] = RenderModel();
+    m_sRenderModelNodePoseKey[uiSide].Clear();
+    m_RenderModelNodePoses[uiSide].Clear();
+    m_RenderModelPathFB[uiSide] = XR_NULL_PATH;
+  }
+
+  PL_LOCK(m_RenderModelMutex);
+  for (plUInt32 uiSide : {0, 1})
+  {
+    m_PendingRenderModel[uiSide] = PendingRenderModel();
+  }
+}
+
+void plOpenXRInputDevice::PublishRenderModel(plUInt32 uiSide, const plString& sKey, plDynamicArray<plUInt8>&& glb)
+{
+  m_RenderModelState[uiSide].m_sKey = sKey;
+
+  PL_LOCK(m_RenderModelMutex);
+  PendingRenderModel& pending = m_PendingRenderModel[uiSide];
+  pending.m_Model.m_sKey = sKey;
+  pending.m_Model.m_Glb = std::move(glb);
+  pending.m_bPending = true;
+}
+
+void plOpenXRInputDevice::UpdateRenderModels(InputSnapshot& snapshot)
+{
+  const bool bMSFT = m_pOpenXR->m_Extensions.m_bControllerModelMSFT;
+  const bool bFB = m_pOpenXR->m_Extensions.m_bRenderModelFB;
+  if (!bMSFT && !bFB)
+    return;
+
+  PL_PROFILE_SCOPE("UpdateRenderModels");
+
+  const plTime now = plTime::Now();
+  for (plUInt32 uiSide : {0, 1})
+  {
+    RenderModelState& state = m_RenderModelState[uiSide];
+
+    // Without a model the key is polled: a controller that is switched on later gets its model without a profile change.
+    if (!state.m_bQueryKey && state.m_sKey.IsEmpty() && now >= state.m_NextRetry)
+    {
+      state.m_bQueryKey = true;
+    }
+
+    if (bMSFT)
+    {
+      UpdateRenderModelMSFT(uiSide, snapshot);
+    }
+    else
+    {
+      UpdateRenderModelFB(uiSide);
+    }
+
+    if (state.m_sKey.IsEmpty())
+    {
+      if (now >= state.m_NextRetry)
+      {
+        state.m_NextRetry = now + plTime::MakeFromSeconds(1.0);
+      }
+      snapshot.m_sRenderModelNodePoseKey[uiSide].Clear();
+      snapshot.m_RenderModelNodePoses[uiSide].Clear();
+    }
+  }
+}
+
+void plOpenXRInputDevice::UpdateRenderModelMSFT(plUInt32 uiSide, InputSnapshot& snapshot)
+{
+  RenderModelState& state = m_RenderModelState[uiSide];
+  const plOpenXR::Extensions& ext = m_pOpenXR->m_Extensions;
+
+  if (state.m_bQueryKey)
+  {
+    state.m_bQueryKey = false;
+
+    XrControllerModelKeyStateMSFT keyState{XR_TYPE_CONTROLLER_MODEL_KEY_STATE_MSFT};
+    if (XR_FAILED_RESULT(ext.pfn_xrGetControllerModelKeyMSFT(m_pSession, m_SubActionPath[uiSide], &keyState)))
+    {
+      keyState.modelKey = XR_NULL_CONTROLLER_MODEL_KEY_MSFT;
+    }
+
+    if (keyState.modelKey != state.m_KeyMSFT)
+    {
+      state.m_KeyMSFT = XR_NULL_CONTROLLER_MODEL_KEY_MSFT;
+      state.m_NodeNames.Clear();
+      state.m_NodeStates.Clear();
+
+      if (keyState.modelKey == XR_NULL_CONTROLLER_MODEL_KEY_MSFT)
+      {
+        if (!state.m_sKey.IsEmpty())
+        {
+          PublishRenderModel(uiSide, plString(), plDynamicArray<plUInt8>());
+        }
+      }
+      else
+      {
+        // Two-call idiom for the .glb bytes. A failure leaves the key unset, so the next poll tries again.
+        plUInt32 uiSize = 0;
+        plDynamicArray<plUInt8> glb;
+        XrResult res = ext.pfn_xrLoadControllerModelMSFT(m_pSession, keyState.modelKey, 0, &uiSize, nullptr);
+        if (!XR_FAILED_RESULT(res) && uiSize > 0)
+        {
+          glb.SetCountUninitialized(uiSize);
+          res = ext.pfn_xrLoadControllerModelMSFT(m_pSession, keyState.modelKey, uiSize, &uiSize, glb.GetData());
+          glb.SetCount(uiSize);
+        }
+
+        // Node names, once per key. xrGetControllerModelStateMSFT reports the poses in this order.
+        plHybridArray<XrControllerModelNodePropertiesMSFT, 16> nodeProperties;
+        if (!XR_FAILED_RESULT(res) && !glb.IsEmpty())
+        {
+          XrControllerModelPropertiesMSFT properties{XR_TYPE_CONTROLLER_MODEL_PROPERTIES_MSFT};
+          if (!XR_FAILED_RESULT(ext.pfn_xrGetControllerModelPropertiesMSFT(m_pSession, keyState.modelKey, &properties)) && properties.nodeCountOutput > 0)
+          {
+            nodeProperties.SetCount(properties.nodeCountOutput, {XR_TYPE_CONTROLLER_MODEL_NODE_PROPERTIES_MSFT});
+            properties.nodeCapacityInput = nodeProperties.GetCount();
+            properties.nodeProperties = nodeProperties.GetData();
+            if (XR_FAILED_RESULT(ext.pfn_xrGetControllerModelPropertiesMSFT(m_pSession, keyState.modelKey, &properties)))
+            {
+              nodeProperties.Clear();
+            }
+            else
+            {
+              nodeProperties.SetCount(properties.nodeCountOutput);
+            }
+          }
+        }
+
+        if (XR_FAILED_RESULT(res) || glb.IsEmpty())
+        {
+          plLog::Warning("OpenXR: Loading the {} controller model failed: {}", uiSide == 0 ? "left" : "right", res);
+
+          // The previous model belongs to another controller; dropping it also re-enables the poll that retries the load.
+          if (!state.m_sKey.IsEmpty())
+          {
+            PublishRenderModel(uiSide, plString(), plDynamicArray<plUInt8>());
+          }
+        }
+        else
+        {
+          state.m_KeyMSFT = keyState.modelKey;
+          for (const XrControllerModelNodePropertiesMSFT& node : nodeProperties)
+          {
+            state.m_NodeNames.PushBack(node.nodeName);
+          }
+          state.m_NodeStates.SetCount(state.m_NodeNames.GetCount(), {XR_TYPE_CONTROLLER_MODEL_NODE_STATE_MSFT});
+
+          plStringBuilder sKey;
+          sKey.SetFormat("msft:{}", plArgU((plUInt64)keyState.modelKey, 16, true, 16));
+          plLog::Info("OpenXR: Loaded the {} controller model {} ({} bytes, {} nodes).", uiSide == 0 ? "left" : "right", sKey, glb.GetCount(), state.m_NodeNames.GetCount());
+          PublishRenderModel(uiSide, sKey, std::move(glb));
+        }
+      }
+    }
+  }
+
+  if (state.m_KeyMSFT == XR_NULL_CONTROLLER_MODEL_KEY_MSFT || state.m_NodeStates.IsEmpty())
+    return;
+
+  // Node poses every tick: buttons, triggers and sticks move with the user's fingers.
+  XrControllerModelStateMSFT modelState{XR_TYPE_CONTROLLER_MODEL_STATE_MSFT};
+  modelState.nodeCapacityInput = state.m_NodeStates.GetCount();
+  modelState.nodeStates = state.m_NodeStates.GetData();
+  if (XR_FAILED_RESULT(ext.pfn_xrGetControllerModelStateMSFT(m_pSession, state.m_KeyMSFT, &modelState)))
+    return;
+
+  const plUInt32 uiCount = plMath::Min(modelState.nodeCountOutput, state.m_NodeStates.GetCount());
+  plDynamicArray<RenderModelNodePose>& poses = snapshot.m_RenderModelNodePoses[uiSide];
+  poses.SetCount(uiCount);
+  for (plUInt32 i = 0; i < uiCount; ++i)
+  {
+    // Each pose is in its parent node's space, converted into engine axes like every other pose; plGlbLoader converts
+    // the glTF hierarchy with the same mapping.
+    const XrPosef& pose = state.m_NodeStates[i].nodePose;
+    RenderModelNodePose& out = poses[i];
+    if (out.m_sNodeName != state.m_NodeNames[i])
+    {
+      out.m_sNodeName = state.m_NodeNames[i];
+    }
+    out.m_Transform = plTransform(plOpenXR::ConvertPosition(pose.position), plOpenXR::ConvertOrientation(pose.orientation));
+    out.m_bVisible = true;
+  }
+
+  if (snapshot.m_sRenderModelNodePoseKey[uiSide] != state.m_sKey)
+  {
+    snapshot.m_sRenderModelNodePoseKey[uiSide] = state.m_sKey;
+  }
+}
+
+void plOpenXRInputDevice::UpdateRenderModelFB(plUInt32 uiSide)
+{
+  RenderModelState& state = m_RenderModelState[uiSide];
+  if (!state.m_bQueryKey || m_RenderModelPathFB[uiSide] == XR_NULL_PATH)
+    return;
+
+  state.m_bQueryKey = false;
+  const plOpenXR::Extensions& ext = m_pOpenXR->m_Extensions;
+
+  // The runtime rejects property queries for paths the application has not enumerated first.
+  if (!m_bRenderModelPathsEnumeratedFB)
+  {
+    plUInt32 uiPathCount = 0;
+    if (XR_FAILED_RESULT(ext.pfn_xrEnumerateRenderModelPathsFB(m_pSession, 0, &uiPathCount, nullptr)))
+      return;
+
+    plHybridArray<XrRenderModelPathInfoFB, 8> paths;
+    paths.SetCount(uiPathCount, {XR_TYPE_RENDER_MODEL_PATH_INFO_FB});
+    if (uiPathCount > 0 && XR_FAILED_RESULT(ext.pfn_xrEnumerateRenderModelPathsFB(m_pSession, uiPathCount, &uiPathCount, paths.GetData())))
+      return;
+
+    m_bRenderModelPathsEnumeratedFB = true;
+  }
+
+  // Subset 1 is plain glTF 2.0 without texture compression extensions, which plGlbLoader reads.
+  XrRenderModelCapabilitiesRequestFB capabilities{XR_TYPE_RENDER_MODEL_CAPABILITIES_REQUEST_FB};
+  capabilities.flags = XR_RENDER_MODEL_SUPPORTS_GLTF_2_0_SUBSET_1_BIT_FB;
+  XrRenderModelPropertiesFB properties{XR_TYPE_RENDER_MODEL_PROPERTIES_FB};
+  properties.next = &capabilities;
+
+  XrResult res = ext.pfn_xrGetRenderModelPropertiesFB(m_pSession, m_RenderModelPathFB[uiSide], &properties);
+  // XR_RENDER_MODEL_UNAVAILABLE_FB is a success code meaning "no model for this path right now".
+  if (XR_FAILED_RESULT(res) || res == XR_RENDER_MODEL_UNAVAILABLE_FB || properties.modelKey == XR_NULL_RENDER_MODEL_KEY_FB)
+  {
+    state.m_KeyFB = XR_NULL_RENDER_MODEL_KEY_FB;
+    if (!state.m_sKey.IsEmpty())
+    {
+      PublishRenderModel(uiSide, plString(), plDynamicArray<plUInt8>());
+    }
+    return;
+  }
+
+  if (properties.modelKey == state.m_KeyFB)
+    return;
+
+  XrRenderModelLoadInfoFB loadInfo{XR_TYPE_RENDER_MODEL_LOAD_INFO_FB};
+  loadInfo.modelKey = properties.modelKey;
+
+  XrRenderModelBufferFB buffer{XR_TYPE_RENDER_MODEL_BUFFER_FB};
+  plDynamicArray<plUInt8> glb;
+  res = ext.pfn_xrLoadRenderModelFB(m_pSession, &loadInfo, &buffer);
+  if (!XR_FAILED_RESULT(res) && res != XR_RENDER_MODEL_UNAVAILABLE_FB && buffer.bufferCountOutput > 0)
+  {
+    glb.SetCountUninitialized(buffer.bufferCountOutput);
+    buffer.bufferCapacityInput = glb.GetCount();
+    buffer.buffer = glb.GetData();
+    res = ext.pfn_xrLoadRenderModelFB(m_pSession, &loadInfo, &buffer);
+    glb.SetCount(buffer.bufferCountOutput);
+  }
+
+  if (XR_FAILED_RESULT(res) || res == XR_RENDER_MODEL_UNAVAILABLE_FB || glb.IsEmpty())
+  {
+    // Not ready yet; the key stays unset so the next poll tries again.
+    plLog::Debug("OpenXR: The {} controller render model is not available yet ({}).", uiSide == 0 ? "left" : "right", res);
+    return;
+  }
+
+  state.m_KeyFB = properties.modelKey;
+
+  plStringBuilder sKey;
+  sKey.SetFormat("fb:{}:{}:{}", properties.modelName, properties.modelVersion, plArgU((plUInt64)properties.modelKey, 16, true, 16));
+  plLog::Info("OpenXR: Loaded the {} controller model {} ({} bytes).", uiSide == 0 ? "left" : "right", sKey, glb.GetCount());
+  PublishRenderModel(uiSide, sKey, std::move(glb));
+}
+
 void plOpenXRInputDevice::UpdateActionsOnInputThread()
 {
   if (m_pSession == XR_NULL_HANDLE)
     return;
   PL_PROFILE_SCOPE("UpdateActionsThreaded");
 
-  // Write to the buffer that main thread is NOT reading
-  const plInt32 writeIdx = 1 - m_iReadableSnapshot;
-  InputSnapshot& snapshot = m_InputSnapshots[writeIdx];
+  InputSnapshot& snapshot = m_WorkingSnapshot;
 
   // Sync actions
   XrActiveActionSet activeActionSet{m_pActionSet, XR_NULL_PATH};
@@ -1051,8 +1997,38 @@ void plOpenXRInputDevice::UpdateActionsOnInputThread()
   syncInfo.activeActionSets = &activeActionSet;
 
   XrResult res = xrSyncActions(m_pSession, &syncInfo);
-  if (res != XR_SUCCESS)
+  if (XR_FAILED_RESULT(res))
     return;
+
+  if (res == XR_SESSION_NOT_FOCUSED)
+  {
+    // Another application (e.g. the runtime's system menu) has input focus: every action reports inactive. Release all
+    // buttons and axes so nothing stays held, and drop haptics instead of letting them pile up until focus returns.
+    {
+      PL_LOCK(m_HapticMutex);
+      m_PendingHaptics[0].m_bPending = false;
+      m_PendingHaptics[1].m_bPending = false;
+    }
+
+    for (auto it = snapshot.m_InputSlotValues.GetIterator(); it.IsValid(); ++it)
+    {
+      it.Value() = 0.0f;
+    }
+
+    PublishSnapshot();
+    return;
+  }
+
+  if (m_bInteractionProfileDirty.Set(false))
+  {
+    UpdateInteractionProfiles(snapshot);
+  }
+
+  if (m_bGlyphsDirty)
+  {
+    m_bGlyphsDirty = false;
+    UpdateGlyphs();
+  }
 
   ApplyPendingHaptics();
 
@@ -1064,6 +2040,7 @@ void plOpenXRInputDevice::UpdateActionsOnInputThread()
 
   const XrSpace baseSpace = m_pOpenXR->GetBaseSpace();
   UpdateLeftShoulderTracking(snapshot, baseSpace, time);
+  UpdateEyeGaze(snapshot, baseSpace, time);
 
   for (plUInt32 uiSide : {0, 1})
   {
@@ -1181,8 +2158,6 @@ void plOpenXRInputDevice::UpdateActionsOnInputThread()
     else
     {
       // Fast path: query only bound actions
-      // Always write values (don't use changedSinceLastSync) because with double-buffering
-      // the back buffer may contain stale data from when it was previously the front buffer
       XrActionStateGetInfo getInfo{XR_TYPE_ACTION_STATE_GET_INFO};
       getInfo.subactionPath = subActionPath;
 
@@ -1315,19 +2290,22 @@ void plOpenXRInputDevice::UpdateActionsOnInputThread()
       }
     }
 
+    UpdatePalmPose(uiSide, snapshot, baseSpace, time);
+
     m_DiscoveredFeatures[uiSide].Add(plXRDeviceFeatures::GripPose);
     m_DiscoveredFeatures[uiSide].Add(plXRDeviceFeatures::AimPose);
     snapshot.m_SupportedFeatures[uiControllerId] = m_DiscoveredFeatures[uiSide];
   }
 
-  // Atomically swap which buffer is readable
-  // Main thread will pick up new data on next frame
-  m_iReadableSnapshot = writeIdx;
+  UpdateMapActions(snapshot);
+  UpdateRenderModels(snapshot);
+
+  PublishSnapshot();
 }
 
 void plOpenXRInputDevice::UpdateControllerState()
 {
-  for (plUInt32 uiControllerId : {m_iLeftControllerDeviceID, m_iRightControllerDeviceID, m_iLeftShoulderDeviceId})
+  for (plUInt32 uiControllerId : {m_iLeftControllerDeviceID, m_iRightControllerDeviceID, m_iLeftShoulderDeviceId, m_iEyeGazeDeviceId})
   {
     const bool bDeviceConnected = m_SupportedFeatures[uiControllerId].IsSet(plXRDeviceFeatures::AimPose);
 
@@ -1492,8 +2470,6 @@ void plOpenXRInputDevice::StartInputThread()
   if (m_pInputThread != nullptr)
     return;
 
-  // Initialize double-buffer snapshots
-  m_iReadableSnapshot = 0;
   m_bInputThreadRunning = true;
 
   m_pInputThread = PL_DEFAULT_NEW(InputThread, this);
