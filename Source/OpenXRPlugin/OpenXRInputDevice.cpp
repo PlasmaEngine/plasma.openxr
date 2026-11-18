@@ -135,7 +135,7 @@ Profile { string %Path { "/interaction_profiles/htc/vive_controller" } string %D
   Component { string %Path { "/input/trigger/value" } string %Type { "Float" } string %Actions { "trigger_value" } }
   Component { string %Path { "/input/trigger/click" } string %Type { "Boolean" } string %Actions { "select_click" } }
   Component { string %Path { "/input/menu/click" } string %Type { "Boolean" } string %Actions { "menu_click" } }
-  Component { string %Path { "/input/squeeze/click" } string %Type { "Boolean" } string %Actions { "grip_click" } }
+  Component { string %Path { "/input/squeeze/click" } string %Type { "Boolean" } string %Actions { "grip_value", "grip_click" } }
   Component { string %Path { "/input/trackpad" } string %Type { "Vector2" } string %Actions { "primary_analog_stick" } }
   Component { string %Path { "/input/trackpad/click" } string %Type { "Boolean" } string %Actions { "primary_analog_stick_click" } }
   Component { string %Path { "/input/trackpad/touch" } string %Type { "Boolean" } string %Actions { "primary_analog_stick_touch" } }
@@ -184,7 +184,7 @@ Profile { string %Path { "/interaction_profiles/htc/vive_cosmos_controller" } st
   Component { string %Path { "/input/trigger/value" } string %Type { "Float" } string %Actions { "trigger_value" } }
   Component { string %Path { "/input/trigger/click" } string %Type { "Boolean" } string %Actions { "select_click" } }
   Component { string %Path { "/input/menu/click" } string %Hands { "left" } string %Type { "Boolean" } string %Actions { "menu_click" } }
-  Component { string %Path { "/input/squeeze/click" } string %Type { "Boolean" } string %Actions { "grip_click" } }
+  Component { string %Path { "/input/squeeze/click" } string %Type { "Boolean" } string %Actions { "grip_value", "grip_click" } }
   Component { string %Path { "/input/thumbstick" } string %Type { "Vector2" } string %Actions { "primary_analog_stick" } }
   Component { string %Path { "/input/thumbstick/click" } string %Type { "Boolean" } string %Actions { "primary_analog_stick_click" } }
   Component { string %Path { "/input/thumbstick/touch" } string %Type { "Boolean" } string %Actions { "primary_analog_stick_touch" } }
@@ -200,7 +200,7 @@ Profile { string %Path { "/interaction_profiles/htc/vive_focus3_controller" } st
   Component { string %Path { "/input/trigger/value" } string %Type { "Float" } string %Actions { "trigger_value" } }
   Component { string %Path { "/input/trigger/click" } string %Type { "Boolean" } string %Actions { "select_click" } }
   Component { string %Path { "/input/menu/click" } string %Hands { "left" } string %Type { "Boolean" } string %Actions { "menu_click" } }
-  Component { string %Path { "/input/squeeze/click" } string %Type { "Boolean" } string %Actions { "grip_click" } }
+  Component { string %Path { "/input/squeeze/click" } string %Type { "Boolean" } string %Actions { "grip_value", "grip_click" } }
   Component { string %Path { "/input/thumbstick" } string %Type { "Vector2" } string %Actions { "primary_analog_stick" } }
   Component { string %Path { "/input/thumbstick/click" } string %Type { "Boolean" } string %Actions { "primary_analog_stick_click" } }
   Component { string %Path { "/input/thumbstick/touch" } string %Type { "Boolean" } string %Actions { "primary_analog_stick_touch" } }
@@ -2290,6 +2290,8 @@ void plOpenXRInputDevice::UpdateActionsOnInputThread()
       }
     }
 
+    ReportPoseValidity(uiSide, deviceState);
+
     UpdatePalmPose(uiSide, snapshot, baseSpace, time);
 
     m_DiscoveredFeatures[uiSide].Add(plXRDeviceFeatures::GripPose);
@@ -2390,6 +2392,23 @@ plResult plOpenXRInputDevice::TriggerHapticPulse(plXRDeviceID deviceID, plTime d
   }
 
   return PL_SUCCESS;
+}
+
+void plOpenXRInputDevice::ReportPoseValidity(plUInt32 uiSide, const plXRDeviceState& state)
+{
+  // Runs at the input thread's tick rate, so only a change is logged. A controller whose poses never become valid is
+  // hidden by its plDeviceTrackingComponent, which otherwise looks like a missing model or a hand that cannot grab.
+  const plInt8 iGrip = state.m_bGripPoseIsValid ? 1 : 0;
+  const plInt8 iAim = state.m_bAimPoseIsValid ? 1 : 0;
+
+  if (m_iLastGripValid[uiSide] == iGrip && m_iLastAimValid[uiSide] == iAim)
+    return;
+
+  m_iLastGripValid[uiSide] = iGrip;
+  m_iLastAimValid[uiSide] = iAim;
+
+  plLog::Info("OpenXR: {} controller poses: grip {}, aim {} ({}).", uiSide == 0 ? "Left" : "Right", iGrip ? "valid" : "INVALID",
+    iAim ? "valid" : "INVALID", m_bUseBatchedSpaceLocation ? "xrLocateSpacesKHR" : "xrLocateSpace");
 }
 
 void plOpenXRInputDevice::ReportLocateFailure(plUInt32 uiSide, const char* szWhat, XrResult res, XrSpace baseSpace, XrTime time)

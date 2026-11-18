@@ -309,6 +309,12 @@ private:
   // Last reported pose-location result per hand, so the input thread's tick rate cannot spam the log.
   XrResult m_LastLocateFailure[2] = {XR_SUCCESS, XR_SUCCESS};
 
+  // Last reported grip and aim pose validity per hand (-1 = not reported yet), so a change is logged once.
+  plInt8 m_iLastGripValid[2] = {-1, -1};
+  plInt8 m_iLastAimValid[2] = {-1, -1};
+
+  void ReportPoseValidity(plUInt32 uiSide, const plXRDeviceState& state);
+
   // XR.BatchedSpaceLocation, latched at action creation (session start). The cvar must NOT be read live on the
   // input thread: it can now be toggled from inside the headset (VR CVars panel), and switching the input thread
   // onto the xrLocateSpacesKHR path mid-session faults inside SteamVR's vrclient - a full system hang on this
